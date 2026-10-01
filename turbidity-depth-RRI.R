@@ -1,3 +1,4 @@
+# Load required packages
 library(tidyverse)
 library(lubridate)
 library(here)
@@ -6,18 +7,15 @@ library(oddwater)
 
 # Import sonde data ------------------------------------------------------------
 # Data was QC's and provided by Andrew Tran in C-EMP 
-df_1m <- read_csv(here("turbidity-depth-RRI","data","RRI_data_1m.csv")) %>% 
-  mutate(depth_m = 1)
-df_3m <- read_csv(here("turbidity-depth-RRI","data","RRI_data_3m.csv")) %>% 
-  mutate(depth_m = 3) 
-df_6m <- read_csv(here("turbidity-depth-RRI","data","RRI_data_6m.csv")) %>% 
-  mutate(depth_m = 6)
+df_1m <- read_csv(here("data","RRI_data_1m.csv")) |> mutate(depth_m = 1)
+df_3m <- read_csv(here("data","RRI_data_3m.csv")) |> mutate(depth_m = 3) 
+df_6m <- read_csv(here("data","RRI_data_6m.csv")) |> mutate(depth_m = 6)
 
 # Combine data from all three depths
 wq_data <- bind_rows(df_1m, df_3m, df_6m)
 
 # Add temporal and water year type data
-wq_data <- wq_data %>%
+wq_data <- wq_data |>
   mutate(
     # all data is timestamped to Pacific Standard Time
     date_time = ymd_hms(date_time, tz = "Etc/GMT+8", truncated = 3), 
@@ -30,21 +28,20 @@ wq_data <- wq_data %>%
   )
 
 # Add table of WY types downloaded from CDEC and select SJR version
-sj_wy_types <- read_csv(here("turbidity-depth-RRI","data","WY-type.csv")) |> 
+sj_wy_types <- read_csv(here("data","WY-type.csv")) |> 
   select("Year","Yr-type-SJR") |> 
   rename("wy_type" = "Yr-type-SJR") |> 
   rename("water_year" = "Year")
 
 # Join WY metadata with main data frame
-wq_data <- wq_data %>%
-  left_join(sj_wy_types, by = "water_year") %>%
+wq_data <- wq_data |>
+  left_join(sj_wy_types, by = "water_year") |>
   # Set factors so graphs plot in logical wetness order rather than alphabetical
   mutate(wy_type = factor(wy_type, levels = c("W", "AN", "BN", "D", "C")))
 
 # Basic data QC
 # Remove any erroneous negative sonde turbidity readings
-wq_clean <- wq_data %>%
-  filter(turb_fnu >= 0 | is.na(turb_fnu))
+wq_clean <- wq_data |> filter(turb_fnu >= 0 | is.na(turb_fnu))
 
 # Define a turbidity maximum based on RRI historical baseline (e.g., 100 FNU)
 qaqc_threshold <- 100
