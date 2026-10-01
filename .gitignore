@@ -47,3 +47,8 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+
+# Ignore all qs2 and data caches in this subproject
+*.qs2
+data/*.qs2
+data/*.csv
