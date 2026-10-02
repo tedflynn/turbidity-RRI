@@ -62,8 +62,18 @@ wq_qc1 |> count(gross_range_flag)
 wq_qc2 <- flag_robust_outliers(wq_qc1, window = 12, z_thresh = 3.5, noise_floor = 5)
 wq_qc2 |> count(spike_flag)
 
+# Step 2b: flag erratic periods (sustained disturbances longer than step 2's
+# rolling window, which it can't see). Flagged for review, not removed.
+wq_qc2b <- flag_erratic_periods(wq_qc2, window = 48, jump_thresh = 5)
+wq_qc2b |> count(depth_m, erratic_flag)
+
+# Step 2c: flag cross-depth drift (one sensor climbing away from the other two,
+# e.g. biofouling that resets at a service visit). Flagged for review, not removed.
+wq_qc2c <- flag_depth_drift(wq_qc2b, diff_thresh = 8, ratio_thresh = 3)
+wq_qc2c |> count(depth_m, drift_flag)
+
 # Step 3: classify flagged points as isolated spikes vs sustained excursions
-wq_qc3 <- classify_run_duration(wq_qc2, max_spike_len = 2)
+wq_qc3 <- classify_run_duration(wq_qc2c, max_spike_len = 2)
 wq_qc3 |> count(duration_class)
 
 # Step 4: check sustained excursions for corroborating signal in other channels
@@ -82,21 +92,16 @@ wq_qc4b |> filter(duration_class == "Sustained Excursion") |> count(run_corrobor
 wq_qc_final <- finalize_qc_flags(wq_qc4b)
 wq_qc_final |> count(qaqc_flag)
 
-# Analysis-ready turbidity for the Golden Mussel clarity comparison: on top of
-# turb_fnu_final, also excludes "Flagged: Uncorroborated Excursion (review)"
-# points. These are most likely vessel-wake/dredging resuspension in this
-# working ship channel -- a real but non-biological confound for a clarity
-# comparison, not ambient water conditions. Kept as a separate column (rather
-# than overwriting turb_fnu_final) so the underlying QC'd dataset still has
-# the real values if we want to run a with/without sensitivity check later.
-wq_qc_final <- wq_qc_final |>
-  mutate(
-    turb_fnu_analysis = if_else(
-      qaqc_flag == "Flagged: Uncorroborated Excursion (review)",
-      NA_real_,
-      turb_fnu_final
-    )
-  )
+# Step 6: analysis-ready turbidity for the Golden Mussel clarity comparison.
+# On top of turb_fnu_final, excludes the "Flagged: ... (review)" points
+# (excursions, erratic periods, depth drift) and
+# any summer episode above 100 FNU (+/- 6 hrs). These are most likely
+# vessel-wake/dredging resuspension or instrument problems -- real but
+# non-ambient conditions that confound a clarity comparison. Kept as a
+# separate column (rather than overwriting turb_fnu_final) so a with/without
+# sensitivity check is still possible later; analysis_exclusion records why.
+wq_qc_final <- prepare_analysis_turbidity(wq_qc_final, ceiling = 100, pad_readings = 24)
+wq_qc_final |> filter(month %in% 7:9) |> count(analysis_exclusion)
 
 # 5. SUMMER TURBIDITY ISOLATION & INVASION FLAG
 summer_turb <- wq_qc_final %>%

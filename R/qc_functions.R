@@ -7,6 +7,17 @@
 # frame with new columns added (nothing is dropped), so you can inspect the
 # result of each step before moving to the next.
 
+# Helper: TRUE for every row within +/- pad rows of a TRUE in `flag`. Uses a
+# cumulative-sum window difference so it stays fast on ~600k-row series.
+# `flag` must be logical with no NAs and ordered by time within one depth.
+near_flag <- function(flag, pad) {
+  n <- length(flag)
+  cs <- cumsum(flag)
+  idx <- seq_len(n)
+  lo <- idx - pad - 1L
+  (cs[pmin(idx + pad, n)] - if_else(lo < 1L, 0L, cs[pmax(lo, 1L)])) > 0
+}
+
 # Step 1: Gross/physical range check -------------------------------------
 # Flags values that are physically impossible for the sensor, not values
 # that are merely unusual. max_val defaults to the YSI EXO2 turbidity smart
@@ -47,6 +58,87 @@ flag_robust_outliers <- function(df, window = 12, z_thresh = 3.5, noise_floor = 
       )
     ) |>
     ungroup()
+}
+
+# Step 2b: Erratic-period detection -----------------------------------------
+# Step 2 compares each point to a +/-3 hr rolling baseline, so it goes blind
+# when a disturbance lasts longer than the window: the baseline itself fills
+# with disturbed data. This step instead measures how erratic the series is,
+# using the median absolute 15-min change over a centered 24 hr window.
+# Quiet data moves ~0.4 FNU per step; the multi-week erratic periods found in
+# 3m (Sept-Oct 2008) and 6m (Sept 2014) move ~90 FNU per step. The median
+# (not mean) keeps a few isolated spikes from tripping the flag.
+flag_erratic_periods <- function(df, window = 48, jump_thresh = 5) {
+  df |>
+    group_by(depth_m) |>
+    arrange(date_time, .by_group = TRUE) |>
+    mutate(
+      abs_jump = abs(turb_fnu_qc - lag(turb_fnu_qc)),
+      med_jump = slide_dbl(abs_jump, median, na.rm = TRUE, .before = window, .after = window),
+      erratic_flag = case_when(
+        is.na(turb_fnu_qc) ~ NA_character_,
+        !is.na(med_jump) & med_jump > jump_thresh ~ "Fail: Erratic Period",
+        TRUE ~ "Pass"
+      )
+    ) |>
+    ungroup()
+}
+
+# Step 2c: Cross-depth drift detection --------------------------------------
+# Biofouling shows up as a slow one-sensor climb (e.g. 1m rising from ~9 to
+# 73 FNU over Sept 27-Oct 2 2018, then resetting at a service visit) that
+# steps 2 and 2b can't see: no spikes, and the local baseline just follows
+# the ramp. All three sondes share one housing, so each depth's 24 hr median
+# level is compared with the mean of the other depths' levels. A depth is
+# flagged when it stays more than `diff_thresh` FNU AND `ratio_thresh` times
+# above them for at least `min_readings` in a row (96 = 24 hrs), with a buffer
+# of `pad_readings` (96 = 24 hrs) either side to catch the ramp-up. Upward
+# only: fouling reads high. level_24h/other_level_24h are kept for inspection.
+# Defaults (8 FNU, 3x) were chosen so steady season-long offsets between depths
+# (e.g. 1m ~10 vs ~5 FNU in summer 2009-2010, 6m ~18 FNU in 2011, with
+# chlorophyll unchanged) count as normal depth differences, not drift; at the
+# looser 5 FNU / 2x they would exclude 30-47% of those summers.
+flag_depth_drift <- function(df, window = 48, diff_thresh = 8, ratio_thresh = 3,
+                             min_readings = 96, pad_readings = 96) {
+  lev <- df |>
+    group_by(depth_m) |>
+    arrange(date_time, .by_group = TRUE) |>
+    mutate(level_24h = slide_dbl(turb_fnu_qc, median, na.rm = TRUE, .before = window, .after = window)) |>
+    ungroup()
+
+  wide <- lev |>
+    select(date_time, depth_m, level_24h) |>
+    pivot_wider(names_from = depth_m, values_from = level_24h, names_prefix = "lvl_")
+  lvl_cols <- grep("^lvl_", names(wide), value = TRUE)
+
+  other <- map_dfr(sort(unique(lev$depth_m)), function(d) {
+    m <- rowMeans(wide[setdiff(lvl_cols, paste0("lvl_", d))], na.rm = TRUE)
+    tibble(date_time = wide$date_time, depth_m = d, other_level_24h = if_else(is.nan(m), NA_real_, m))
+  })
+
+  lev |>
+    left_join(other, by = c("date_time", "depth_m")) |>
+    group_by(depth_m) |>
+    arrange(date_time, .by_group = TRUE) |>
+    mutate(
+      candidate = !is.na(level_24h) & !is.na(other_level_24h) &
+        (level_24h - other_level_24h) > diff_thresh &
+        level_24h / other_level_24h > ratio_thresh,
+      run_id = consecutive_id(candidate)
+    ) |>
+    group_by(depth_m, run_id) |>
+    mutate(sustained = candidate & n() >= min_readings) |>
+    group_by(depth_m) |>
+    mutate(
+      in_drift = near_flag(sustained, pad_readings),
+      drift_flag = case_when(
+        is.na(turb_fnu_qc) ~ NA_character_,
+        in_drift ~ "Fail: Depth Drift",
+        TRUE ~ "Pass"
+      )
+    ) |>
+    ungroup() |>
+    select(-candidate, -run_id, -sustained, -in_drift)
 }
 
 # Step 3: Duration-aware classification ----------------------------------
@@ -142,6 +234,36 @@ corroborate_cross_depth <- function(df, z_thresh = 3.5, pad_readings = 1) {
   df |> left_join(runs |> select(depth_m, run_id, depth_corroborated), by = c("depth_m", "run_id"))
 }
 
+# Step 6: Analysis-ready turbidity ------------------------------------------
+# Builds turb_fnu_analysis for the summer clarity comparison, leaving
+# turb_fnu_final untouched. Excludes (1) points flagged for review above and
+# (2) any summer reading above `ceiling` FNU together with a buffer of
+# `pad_readings` (24 = 6 hrs) on each side, so the ramp-up and decay of the
+# same event go with it. The ceiling is a judgment call, not a sensor limit:
+# summer turbidity here is normally <30 FNU (99th percentile 17-26), so
+# readings above 100 are treated as transient disturbances (vessel wake,
+# dredging, instrument problems) rather than ambient clarity. analysis_exclusion
+# records why each point was dropped.
+prepare_analysis_turbidity <- function(df, ceiling = 100, pad_readings = 24, months = 7:9) {
+  df |>
+    group_by(depth_m) |>
+    arrange(date_time, .by_group = TRUE) |>
+    mutate(
+      high_hit = !is.na(turb_fnu_final) & turb_fnu_final > ceiling & month %in% months,
+      in_high_episode = month %in% months & near_flag(high_hit, pad_readings),
+      analysis_exclusion = case_when(
+        qaqc_flag %in% c("Flagged: Uncorroborated Excursion (review)",
+                         "Flagged: Erratic Period (review)",
+                         "Flagged: Depth Drift (review)") ~ qaqc_flag,
+        in_high_episode ~ paste0("Summer episode > ", ceiling, " FNU"),
+        TRUE ~ NA_character_
+      ),
+      turb_fnu_analysis = if_else(is.na(analysis_exclusion), turb_fnu_final, NA_real_)
+    ) |>
+    ungroup() |>
+    select(-high_hit, -in_high_episode)
+}
+
 # Step 5: Final QC decision -----------------------------------------------
 # Gross-range failures and isolated spikes are near-certain glitches, so
 # those are removed (set to NA). A sustained excursion counts as
@@ -156,6 +278,8 @@ finalize_qc_flags <- function(df) {
       any_corroborated = run_corroborated | depth_corroborated,
       qaqc_flag = case_when(
         gross_range_flag == "Fail: Gross Range" ~ "Removed: Gross Range",
+        erratic_flag == "Fail: Erratic Period" ~ "Flagged: Erratic Period (review)",
+        drift_flag == "Fail: Depth Drift" ~ "Flagged: Depth Drift (review)",
         duration_class == "Isolated Spike" ~ "Removed: Isolated Spike",
         duration_class == "Sustained Excursion" & !any_corroborated ~ "Flagged: Uncorroborated Excursion (review)",
         duration_class == "Sustained Excursion" & any_corroborated ~ "Kept: Corroborated Event",
