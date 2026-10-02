@@ -52,3 +52,6 @@ rsconnect/
 *.qs2
 data/*.qs2
 data/*.csv
+
+# Ignore Mac DS_Store stuff
+.DS_Store
