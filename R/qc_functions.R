@@ -197,6 +197,56 @@ flag_flat_lines <- function(df, min_run = 12, pad_readings = 24) {
     select(-run_id, -is_flat)
 }
 
+# Step 2e: Cross-depth drift check for another parameter (used for pH) ---------
+# Same idea as step 2c, but built for a bounded, roughly symmetric variable
+# like pH. Each depth's 24 hr median level is compared with the MEDIAN of all
+# three depths' levels (not the mean of the other two): when one sensor fails,
+# the median stays with the two healthy sensors, so the blame lands on the odd
+# one out instead of spreading to its neighbors. Needs all three depths present.
+# Two-sided, in the parameter's own units: for pH, `diff_thresh` = 0.5 units is
+# beyond the 99th percentile of normal depth-to-depth differences (about 0.2-0.5).
+# A depth is flagged when it stays beyond that for `min_readings` in a row
+# (192 = 48 hrs), plus `pad_readings` (48 = 12 hrs) either side.
+# Adds <prefix>_level_24h, <prefix>_ref_24h, <prefix>_drift_flag.
+flag_param_depth_drift <- function(df, param = "ph_qc", prefix = "ph", diff_thresh = 0.5,
+                                   window = 48, min_readings = 192, pad_readings = 48) {
+  lev <- df |>
+    group_by(depth_m) |>
+    arrange(date_time, .by_group = TRUE) |>
+    mutate(.lvl = slide_dbl(.data[[param]], median, na.rm = TRUE, .before = window, .after = window)) |>
+    ungroup()
+
+  wide <- lev |>
+    select(date_time, depth_m, .lvl) |>
+    pivot_wider(names_from = depth_m, values_from = .lvl, names_prefix = "d")
+  a <- wide[[2]]; b <- wide[[3]]; c <- wide[[4]]
+  ref <- pmax(pmin(a, b), pmin(pmax(a, b), c))   # median of three; NA if any is NA
+  ref_tbl <- tibble(date_time = wide$date_time, .ref = ref)
+
+  out <- lev |>
+    left_join(ref_tbl, by = "date_time") |>
+    group_by(depth_m) |>
+    arrange(date_time, .by_group = TRUE) |>
+    mutate(
+      candidate = !is.na(.lvl) & !is.na(.ref) & abs(.lvl - .ref) > diff_thresh,
+      run_id = consecutive_id(candidate)
+    ) |>
+    group_by(depth_m, run_id) |>
+    mutate(sustained = candidate & n() >= min_readings) |>
+    group_by(depth_m) |>
+    mutate(
+      in_drift = near_flag(sustained, pad_readings),
+      .flag = case_when(is.na(.data[[param]]) ~ NA_character_, in_drift ~ "Fail: Depth Drift", TRUE ~ "Pass")
+    ) |>
+    ungroup() |>
+    select(-candidate, -run_id, -sustained, -in_drift)
+
+  names(out)[names(out) == ".lvl"] <- paste0(prefix, "_level_24h")
+  names(out)[names(out) == ".ref"] <- paste0(prefix, "_ref_24h")
+  names(out)[names(out) == ".flag"] <- paste0(prefix, "_drift_flag")
+  out
+}
+
 # Step 3: Duration-aware classification ----------------------------------
 # A single anomalous reading that immediately returns to baseline is a much
 # stronger glitch candidate than a run of several consecutive flagged

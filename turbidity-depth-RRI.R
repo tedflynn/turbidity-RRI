@@ -84,8 +84,14 @@ wq_qc2c |> count(depth_m, drift_flag)
 wq_qc2d <- flag_flat_lines(wq_qc2c, min_run = 12, pad_readings = 24)
 wq_qc2d |> count(depth_m, flat_flag)
 
+# Step 2e: flag pH drifting away from the other two depths (median-of-three
+# reference, +/-0.5 pH units for 48+ hrs). pH only for now -- this does not
+# change turbidity decisions; ph_drift_flag is there for any pH analysis.
+wq_qc2e <- flag_param_depth_drift(wq_qc2d, param = "ph_qc", prefix = "ph", diff_thresh = 0.5)
+wq_qc2e |> count(depth_m, ph_drift_flag)
+
 # Step 3: classify flagged points as isolated spikes vs sustained excursions
-wq_qc3 <- classify_run_duration(wq_qc2d, max_spike_len = 2)
+wq_qc3 <- classify_run_duration(wq_qc2e, max_spike_len = 2)
 wq_qc3 |> count(duration_class)
 
 # Step 4: check sustained excursions for corroborating signal in other channels
