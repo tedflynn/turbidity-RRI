@@ -46,13 +46,67 @@ wq_data <- wq_data |>
 # Remove any erroneous negative sonde turbidity readings
 wq_clean <- wq_data |> filter(turb_fnu >= 0 | is.na(turb_fnu))
 
+# Secondary (automated) QC -------------------------------------------------
+# Field-based primary QC (Wagner et al. 2006 method) has already been applied
+# upstream. These steps catch residual statistical outliers. Each step adds
+# columns without dropping rows, so you can inspect wq_qc1, wq_qc2, etc.
+# individually before trusting the final result. See R/qc_functions.R for
+# the method behind each step and its tunable thresholds.
+source(here("R", "qc_functions.R"))
+
+# Step 1: gross/physical range check
+wq_qc1 <- check_gross_range(wq_clean, min_val = 0, max_val = 4000)
+wq_qc1 |> count(gross_range_flag)
+
+# Step 2: robust local outlier detection (modified z-score on rolling median/MAD)
+wq_qc2 <- flag_robust_outliers(wq_qc1, window = 12, z_thresh = 3.5, noise_floor = 5)
+wq_qc2 |> count(spike_flag)
+
+# Step 3: classify flagged points as isolated spikes vs sustained excursions
+wq_qc3 <- classify_run_duration(wq_qc2, max_spike_len = 2)
+wq_qc3 |> count(duration_class)
+
+# Step 4: check sustained excursions for corroborating signal in other channels
+wq_qc4 <- corroborate_sustained_excursions(wq_qc3, window = 12, corrob_z_thresh = 2)
+wq_qc4 |> filter(duration_class == "Sustained Excursion") |> count(run_corroborated)
+
+# Step 4b: check sustained excursions for a coincident signal at the other
+# two depths (same housing, same site -- a real event should show up in
+# turbidity at more than one depth even if conductivity/DO don't move)
+wq_qc4b <- corroborate_cross_depth(wq_qc4, z_thresh = 3.5, pad_readings = 1)
+wq_qc4b |> filter(duration_class == "Sustained Excursion") |> count(run_corroborated, depth_corroborated)
+
+# Step 5: finalize QC decision (removes gross-range fails and isolated spikes;
+# flags sustained excursions corroborated by neither other channels nor other
+# depths for manual review rather than removing them)
+wq_qc_final <- finalize_qc_flags(wq_qc4b)
+wq_qc_final |> count(qaqc_flag)
+
+# Analysis-ready turbidity for the Golden Mussel clarity comparison: on top of
+# turb_fnu_final, also excludes "Flagged: Uncorroborated Excursion (review)"
+# points. These are most likely vessel-wake/dredging resuspension in this
+# working ship channel -- a real but non-biological confound for a clarity
+# comparison, not ambient water conditions. Kept as a separate column (rather
+# than overwriting turb_fnu_final) so the underlying QC'd dataset still has
+# the real values if we want to run a with/without sensitivity check later.
+wq_qc_final <- wq_qc_final |>
+  mutate(
+    turb_fnu_analysis = if_else(
+      qaqc_flag == "Flagged: Uncorroborated Excursion (review)",
+      NA_real_,
+      turb_fnu_final
+    )
+  )
+
 # 5. SUMMER TURBIDITY ISOLATION & INVASION FLAG
-summer_turb <- wq_clean %>%
+summer_turb <- wq_qc_final %>%
   # Isolate July, August, September
-  filter(month %in% c(7, 8, 9)) 
+  filter(month %in% c(7, 8, 9))
 
 # 6. VISUALIZATION
-ggplot(summer_turb, aes(x = factor(water_year), y = turb_fnu, fill = wy_type)) +
+# Uses turb_fnu_analysis (flagged excursions excluded) -- this is the actual
+# Golden Mussel clarity comparison.
+ggplot(summer_turb, aes(x = factor(water_year), y = turb_fnu_analysis, fill = wy_type)) +
   geom_boxplot(outlier.alpha = 0.3,
                outlier.shape = 21) +
   # space = "free_x" prevents years from artificially stretching in WY types with fewer occurrences
@@ -81,7 +135,10 @@ for (current_depth in depth_levels) {
     filter(depth_m == current_depth)
   
   # Build the faceted time-series plot
-  p <- ggplot(plot_data, aes(x = date_time, y = turb_fnu)) +
+  # Uses turb_fnu_final (flagged excursions still visible) rather than
+  # turb_fnu_analysis, since the point of this plot is to visually screen
+  # for fouling/sensor issues -- hiding flagged events would defeat that.
+  p <- ggplot(plot_data, aes(x = date_time, y = turb_fnu_final)) +
     geom_line(linewidth = 0.3) +
     # Facet by year to isolate specific deployments and artifacts
     facet_wrap(~ water_year, scales = "free_x") +
