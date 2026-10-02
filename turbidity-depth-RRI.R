@@ -54,8 +54,7 @@ summer_turb <- wq_clean %>%
 # 6. VISUALIZATION
 ggplot(summer_turb, aes(x = factor(water_year), y = turb_fnu, fill = wy_type)) +
   geom_boxplot(outlier.alpha = 0.3,
-               outlier.shape = 21,        # Changes to a fillable circle
-               outlier.fill = ) +
+               outlier.shape = 21) +
   # space = "free_x" prevents years from artificially stretching in WY types with fewer occurrences
   facet_grid(depth_m ~ ., scales = "free_x", space = "free_x",
              labeller = labeller(depth_m = function(x) paste(x, "m Depth"))) +
@@ -100,7 +99,7 @@ for (current_depth in depth_levels) {
   # Optional: Save each plot automatically to your working directory
   ggsave(paste0("QC_Turbidity_",current_depth,"m.png"), 
          plot = p, 
-         path = here("turbidity-depth-RRI","plots"), 
+         path = here("plots"), 
          width = 10, 
          height = 6)
 }
