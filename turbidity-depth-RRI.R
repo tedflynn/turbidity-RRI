@@ -18,11 +18,11 @@ wq_data <- bind_rows(df_1m, df_3m, df_6m)
 # Add temporal and water year type data
 wq_data <- wq_data |>
   mutate(
-    # all data is timestamped to Pacific Standard Time (fixed -08:00, no DST).
-    # read_csv() already parses the "-08:00" offset in the raw strings correctly
-    # into a UTC-labeled POSIXct, so we only need to relabel the tzone here, not
-    # reparse the clock digits (ymd_hms() would shift every timestamp by 8 hours).
-    date_time = with_tz(date_time, tzone = "Etc/GMT+8"),
+    # The raw strings carry a "-08:00" suffix, but the clock values are really UTC:
+    # daily temperature/DO/pH cycles, field-sheet exchange times and EMP grab samples
+    # all line up only after subtracting 8 hours. read_csv() parses the string clock
+    # as if it were PST, so shift back 8 h, then express in fixed PST (no DST).
+    date_time = with_tz(date_time - hours(8), tzone = "Etc/GMT+8"),
     year = year(date_time),
     month = month(date_time),
     day = day(date_time),
