@@ -4,6 +4,7 @@ library(lubridate)
 library(here)
 library(slider)
 library(oddwater)
+library(imputeTS)
 
 # Import sonde data ------------------------------------------------------------
 # Data was QC's and provided by Andrew Tran in C-EMP 
@@ -17,9 +18,11 @@ wq_data <- bind_rows(df_1m, df_3m, df_6m)
 # Add temporal and water year type data
 wq_data <- wq_data |>
   mutate(
-    # all data is timestamped to Pacific Standard Time
-    date_time = ymd_hms(date_time, tz = "Etc/GMT+8", truncated = 3), 
-    # truncated argument above prevents failure on 00:00:00
+    # all data is timestamped to Pacific Standard Time (fixed -08:00, no DST).
+    # read_csv() already parses the "-08:00" offset in the raw strings correctly
+    # into a UTC-labeled POSIXct, so we only need to relabel the tzone here, not
+    # reparse the clock digits (ymd_hms() would shift every timestamp by 8 hours).
+    date_time = with_tz(date_time, tzone = "Etc/GMT+8"),
     year = year(date_time),
     month = month(date_time),
     day = day(date_time),
@@ -42,60 +45,6 @@ wq_data <- wq_data |>
 # Basic data QC
 # Remove any erroneous negative sonde turbidity readings
 wq_clean <- wq_data |> filter(turb_fnu >= 0 | is.na(turb_fnu))
-
-# Define a turbidity maximum based on RRI historical baseline (e.g., 100 FNU)
-qaqc_threshold <- 100
-
-wq_clean <- wq_clean |>
-  mutate(
-    # If a value exceeds the threshold, replace it with NA, otherwise keep it
-    turb_fnu = if_else(turb_fnu > qaqc_threshold, NA_real_, turb_fnu),
-    # create a flag column so you have a record of how many points were removed
-    qaqc_flag = if_else(is.na(turb_fnu) & !is.na(do_mgl), "Flagged", "Valid")
-  )
-
-# Generate completeness matrix by Water Year and Depth
-qc_summary <- wq_clean %>%
-  group_by(water_year, depth_m) %>%
-  summarise(
-    total_expected_obs = n(),
-    valid_turb_obs = sum(!is.na(turb_fnu)),
-    completeness_pct = round((valid_turb_obs / total_expected_obs) * 100, 1),
-    mean_turb = mean(turb_fnu, na.rm = TRUE),
-    .groups = "drop"
-  )
-
-wq_qc_relative <- wq_clean |>
-  arrange(depth_m, date_time) |>
-  group_by(depth_m, water_year) |>
-  mutate(
-    # Rolling median using 3 observations before and 3 after (7 total observations)
-    rolling_med = slide_dbl(turb_fnu, median, na.rm = TRUE, .before = 3, .after = 3),
-    
-    # Calculate the absolute deviation from the local median
-    median_dev = abs(turb_fnu - rolling_med),
-    
-    # Flag if the deviation is greater than 20% of the local median 
-    # AND the deviation is greater than a 5 FNU noise floor
-    flag_spike = if_else(
-      median_dev > (0.20 * rolling_med) & median_dev > 5, 
-      "Fail: Spike", 
-      "Pass",
-      missing = "No Data"
-    )
-  ) |>
-  ungroup()
-
-# View the results
-wq_qc_relative |>
-  count(flag_spike)
-
-wq_qc_relative |>
-  count(flag_shift)
-
-# View a summary of the flags to see how much data is being caught
-wq_qc_advanced |>
-  count(flag_spike, flag_shift)
 
 # 5. SUMMER TURBIDITY ISOLATION & INVASION FLAG
 summer_turb <- wq_clean %>%
