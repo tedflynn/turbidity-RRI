@@ -84,11 +84,27 @@ wq_qc2c |> count(depth_m, drift_flag)
 wq_qc2d <- flag_flat_lines(wq_qc2c, min_run = 12, pad_readings = 24)
 wq_qc2d |> count(depth_m, flat_flag)
 
-# Step 2e: flag pH drifting away from the other two depths (median-of-three
-# reference, +/-0.5 pH units for 48+ hrs). pH only for now -- this does not
-# change turbidity decisions; ph_drift_flag is there for any pH analysis.
-wq_qc2e <- flag_param_depth_drift(wq_qc2d, param = "ph_qc", prefix = "ph", diff_thresh = 0.5)
-wq_qc2e |> count(depth_m, ph_drift_flag)
+# Step 2e: flag each of the other parameters drifting away from the other two
+# depths (24 hr median vs the median of all three depths, sustained 48+ hrs).
+# Adds <prefix>_drift_flag columns for any analysis of those parameters; this
+# does not change turbidity decisions. Thresholds sit beyond the 99th percentile
+# of normal depth-to-depth differences (see flag_param_depth_drift()).
+drift_settings <- list(
+  ph   = list(param = "ph_qc",          diff_thresh = 0.5, ratio_thresh = 1),
+  temp = list(param = "watertemp_c_qc", diff_thresh = 1.0, ratio_thresh = 1),
+  cond = list(param = "spcond_uscm_qc", diff_thresh = 100, ratio_thresh = 1.25),
+  do   = list(param = "do_mgl_qc",      diff_thresh = 1.5, ratio_thresh = 1),
+  chl  = list(param = "chlor_ugl_qc",   diff_thresh = 5,   ratio_thresh = 2)
+)
+wq_qc2e <- wq_qc2d
+for (p in names(drift_settings)) {
+  s <- drift_settings[[p]]
+  wq_qc2e <- flag_param_depth_drift(wq_qc2e, param = s$param, prefix = p,
+                                    diff_thresh = s$diff_thresh, ratio_thresh = s$ratio_thresh)
+}
+wq_qc2e |>
+  pivot_longer(ends_with("_drift_flag") & !starts_with("drift"), names_to = "param", values_to = "flag") |>
+  count(param, depth_m, flag) |> filter(flag == "Fail: Depth Drift")
 
 # Step 3: classify flagged points as isolated spikes vs sustained excursions
 wq_qc3 <- classify_run_duration(wq_qc2e, max_spike_len = 2)

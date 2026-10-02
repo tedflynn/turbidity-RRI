@@ -203,13 +203,17 @@ flag_flat_lines <- function(df, min_run = 12, pad_readings = 24) {
 # three depths' levels (not the mean of the other two): when one sensor fails,
 # the median stays with the two healthy sensors, so the blame lands on the odd
 # one out instead of spreading to its neighbors. Needs all three depths present.
-# Two-sided, in the parameter's own units: for pH, `diff_thresh` = 0.5 units is
-# beyond the 99th percentile of normal depth-to-depth differences (about 0.2-0.5).
-# A depth is flagged when it stays beyond that for `min_readings` in a row
-# (192 = 48 hrs), plus `pad_readings` (48 = 12 hrs) either side.
+# Two-sided. A depth is flagged when its level differs from the reference by
+# more than `diff_thresh` (the parameter's own units) AND, if `ratio_thresh` > 1,
+# by more than that multiplicative factor, for `min_readings` in a row (192 =
+# 48 hrs), plus `pad_readings` (48 = 12 hrs) either side. Thresholds are set
+# beyond the 99th percentile of normal depth-to-depth differences (some real
+# stratification exists: 1m runs ~0.5 C and ~0.7 mg/L DO above 6m at the 95th
+# percentile). Settings used for each parameter are in turbidity-depth-RRI.R.
 # Adds <prefix>_level_24h, <prefix>_ref_24h, <prefix>_drift_flag.
 flag_param_depth_drift <- function(df, param = "ph_qc", prefix = "ph", diff_thresh = 0.5,
-                                   window = 48, min_readings = 192, pad_readings = 48) {
+                                   ratio_thresh = 1, window = 48, min_readings = 192,
+                                   pad_readings = 48) {
   lev <- df |>
     group_by(depth_m) |>
     arrange(date_time, .by_group = TRUE) |>
@@ -228,7 +232,8 @@ flag_param_depth_drift <- function(df, param = "ph_qc", prefix = "ph", diff_thre
     group_by(depth_m) |>
     arrange(date_time, .by_group = TRUE) |>
     mutate(
-      candidate = !is.na(.lvl) & !is.na(.ref) & abs(.lvl - .ref) > diff_thresh,
+      candidate = !is.na(.lvl) & !is.na(.ref) & abs(.lvl - .ref) > diff_thresh &
+        pmax(.lvl, .ref) / pmax(pmin(.lvl, .ref), 1e-6) > ratio_thresh,
       run_id = consecutive_id(candidate)
     ) |>
     group_by(depth_m, run_id) |>
