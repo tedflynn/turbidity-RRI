@@ -58,6 +58,13 @@ source(here("R", "qc_functions.R"))
 wq_qc1 <- check_gross_range(wq_clean, min_val = 0, max_val = 4000)
 wq_qc1 |> count(gross_range_flag)
 
+# Step 1b: range screen for temperature, pH, conductivity, DO and chlorophyll
+# (impossible values -> NA in <param>_qc columns; limits in param_limits)
+wq_qc1 <- check_param_ranges(wq_qc1)
+wq_qc1 |>
+  pivot_longer(starts_with("range_flag_"), names_to = "param", values_to = "flag") |>
+  count(param, depth_m, flag) |> filter(flag == "Fail: Range")
+
 # Step 2: robust local outlier detection (modified z-score on rolling median/MAD)
 wq_qc2 <- flag_robust_outliers(wq_qc1, window = 12, z_thresh = 3.5, noise_floor = 5)
 wq_qc2 |> count(spike_flag)
@@ -72,8 +79,13 @@ wq_qc2b |> count(depth_m, erratic_flag)
 wq_qc2c <- flag_depth_drift(wq_qc2b, diff_thresh = 8, ratio_thresh = 3)
 wq_qc2c |> count(depth_m, drift_flag)
 
+# Step 2d: flag flat lines (12+ identical readings in a row = stuck sensor).
+# Flagged for review, not removed.
+wq_qc2d <- flag_flat_lines(wq_qc2c, min_run = 12, pad_readings = 24)
+wq_qc2d |> count(depth_m, flat_flag)
+
 # Step 3: classify flagged points as isolated spikes vs sustained excursions
-wq_qc3 <- classify_run_duration(wq_qc2c, max_spike_len = 2)
+wq_qc3 <- classify_run_duration(wq_qc2d, max_spike_len = 2)
 wq_qc3 |> count(duration_class)
 
 # Step 4: check sustained excursions for corroborating signal in other channels

@@ -35,6 +35,38 @@ check_gross_range <- function(df, min_val = 0, max_val = 4000) {
     )
 }
 
+# Step 1b: Range screen for the other sonde parameters ---------------------
+# Same idea as step 1, applied to temperature, pH, conductivity, DO and
+# chlorophyll. Limits are "impossible for this river or this sensor", not
+# "unusual": they are deliberately wide. Out-of-range values are set to NA in
+# a new <param>_qc column (originals untouched) with a range_flag_<param>
+# column recording why. Defaults, with what they catch in this record:
+#   watertemp_c 5-35 C      9999 codes; 42-100 C readings; 0.1-0.4 C readings (3m Sept 2009, 1m Jun 2022)
+#   ph          5.5-10      0.9-5.5 and 10-277 (2009 3m failure, Mar 2008, Feb 2021)
+#   spcond_uscm 20-5000     1-14 uS/cm and 5,597-134,716 uS/cm
+#   do_mgl      0-25 mg/L   41-1,012 mg/L (Feb 2021)
+#   chlor_ugl   0-400 ug/L  EXO total-algae sensor range; ~7,400 readings above it,
+#                           mostly long blocks (3m Sep-Oct 2008, 1m May-Jun 2009, 6m Mar-Apr 2014)
+# Confirm the sensor-range ones (chlorophyll, temperature) against your sensor
+# spec sheets and the site-based ones (pH, conductivity) against your site knowledge.
+param_limits <- list(
+  watertemp_c = c(5, 35),
+  ph          = c(5.5, 10),
+  spcond_uscm = c(20, 5000),
+  do_mgl      = c(0, 25),
+  chlor_ugl   = c(0, 400)
+)
+
+check_param_ranges <- function(df, limits = param_limits) {
+  for (p in names(limits)) {
+    x <- df[[p]]
+    bad <- !is.na(x) & (x < limits[[p]][1] | x > limits[[p]][2])
+    df[[paste0("range_flag_", p)]] <- case_when(is.na(x) ~ NA_character_, bad ~ "Fail: Range", TRUE ~ "Pass")
+    df[[paste0(p, "_qc")]] <- if_else(bad, NA_real_, x)
+  }
+  df
+}
+
 # Step 2: Robust local outlier detection ---------------------------------
 # Turbidity is heavy-tailed (mostly low, occasional large real spikes), so
 # this uses a rolling median/MAD (robust to outliers) rather than
@@ -141,6 +173,30 @@ flag_depth_drift <- function(df, window = 48, diff_thresh = 8, ratio_thresh = 3,
     select(-candidate, -run_id, -sustained, -in_drift)
 }
 
+# Step 2d: Flat-line (stuck sensor) detection ----------------------------------
+# A sensor that stops updating repeats one value. At 0.1 FNU resolution, short
+# repeats are normal in clear water (runs of 6-9 identical readings at 1-6 FNU
+# are common), so only runs of `min_run` or more (12 = 3 hrs) are flagged,
+# plus `pad_readings` (24 = 6 hrs) either side so neighboring stuck stretches
+# (e.g. 1m, Jan 3-11 2016, 27 hrs at exactly 2.8 FNU; 1427 FNU for 5+ hrs on
+# Dec 15 2015) are caught together. NA breaks a run.
+flag_flat_lines <- function(df, min_run = 12, pad_readings = 24) {
+  df |>
+    group_by(depth_m) |>
+    arrange(date_time, .by_group = TRUE) |>
+    mutate(
+      run_id = consecutive_id(turb_fnu_qc),
+      is_flat = !is.na(turb_fnu_qc) & ave(seq_along(run_id), run_id, FUN = length) >= min_run,
+      flat_flag = case_when(
+        is.na(turb_fnu_qc) ~ NA_character_,
+        near_flag(is_flat, pad_readings) ~ "Fail: Flat Line",
+        TRUE ~ "Pass"
+      )
+    ) |>
+    ungroup() |>
+    select(-run_id, -is_flat)
+}
+
 # Step 3: Duration-aware classification ----------------------------------
 # A single anomalous reading that immediately returns to baseline is a much
 # stronger glitch candidate than a run of several consecutive flagged
@@ -171,18 +227,18 @@ classify_run_duration <- function(df, max_spike_len = 2) {
 # should show up in other sonde channels too (e.g. conductivity drops with
 # freshwater dilution); a turbidity-only excursion with no corroborating
 # signal elsewhere is a stronger fouling/sensor-artifact candidate.
-# Reuses the same robust-z approach from step 2 on spcond_uscm and do_mgl.
+# Reuses the same robust-z approach from step 2 on spcond_uscm_qc and do_mgl_qc (range-screened in step 1b).
 corroborate_sustained_excursions <- function(df, window = 12, corrob_z_thresh = 2) {
   df <- df |>
     group_by(depth_m) |>
     arrange(date_time, .by_group = TRUE) |>
     mutate(
-      cond_roll_median = slide_dbl(spcond_uscm, median, na.rm = TRUE, .before = window, .after = window),
-      cond_roll_mad = slide_dbl(spcond_uscm, mad, na.rm = TRUE, .before = window, .after = window),
-      cond_z = 0.6745 * (spcond_uscm - cond_roll_median) / cond_roll_mad,
-      do_roll_median = slide_dbl(do_mgl, median, na.rm = TRUE, .before = window, .after = window),
-      do_roll_mad = slide_dbl(do_mgl, mad, na.rm = TRUE, .before = window, .after = window),
-      do_z = 0.6745 * (do_mgl - do_roll_median) / do_roll_mad,
+      cond_roll_median = slide_dbl(spcond_uscm_qc, median, na.rm = TRUE, .before = window, .after = window),
+      cond_roll_mad = slide_dbl(spcond_uscm_qc, mad, na.rm = TRUE, .before = window, .after = window),
+      cond_z = 0.6745 * (spcond_uscm_qc - cond_roll_median) / cond_roll_mad,
+      do_roll_median = slide_dbl(do_mgl_qc, median, na.rm = TRUE, .before = window, .after = window),
+      do_roll_mad = slide_dbl(do_mgl_qc, mad, na.rm = TRUE, .before = window, .after = window),
+      do_z = 0.6745 * (do_mgl_qc - do_roll_median) / do_roll_mad,
       row_corroborated = (!is.na(cond_z) & abs(cond_z) > corrob_z_thresh) |
         (!is.na(do_z) & abs(do_z) > corrob_z_thresh)
     ) |>
@@ -254,7 +310,8 @@ prepare_analysis_turbidity <- function(df, ceiling = 100, pad_readings = 24, mon
       analysis_exclusion = case_when(
         qaqc_flag %in% c("Flagged: Uncorroborated Excursion (review)",
                          "Flagged: Erratic Period (review)",
-                         "Flagged: Depth Drift (review)") ~ qaqc_flag,
+                         "Flagged: Depth Drift (review)",
+                         "Flagged: Flat Line (review)") ~ qaqc_flag,
         in_high_episode ~ paste0("Summer episode > ", ceiling, " FNU"),
         TRUE ~ NA_character_
       ),
@@ -280,6 +337,7 @@ finalize_qc_flags <- function(df) {
         gross_range_flag == "Fail: Gross Range" ~ "Removed: Gross Range",
         erratic_flag == "Fail: Erratic Period" ~ "Flagged: Erratic Period (review)",
         drift_flag == "Fail: Depth Drift" ~ "Flagged: Depth Drift (review)",
+        flat_flag == "Fail: Flat Line" ~ "Flagged: Flat Line (review)",
         duration_class == "Isolated Spike" ~ "Removed: Isolated Spike",
         duration_class == "Sustained Excursion" & !any_corroborated ~ "Flagged: Uncorroborated Excursion (review)",
         duration_class == "Sustained Excursion" & any_corroborated ~ "Kept: Corroborated Event",
