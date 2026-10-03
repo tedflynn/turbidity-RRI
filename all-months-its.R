@@ -63,20 +63,24 @@ time_cols <- function(d) {
                                  month(month_start) %in% 6:8 ~ "JJA", TRUE ~ "SON"))
 }
 
-anoms <- pmap_dfr(stations_tbl, function(station, gauge, role) {
-  d <- monthly_turb |>
-    filter(station == !!station) |>
-    inner_join(monthly_flow(gauge), by = "month_start") |>
-    mutate(ly = log10(turb), moy = factor(month(month_start), levels = 1:12))
-  base <- filter(d, month_start < detect)
-  if (nrow(base) < min_baseline_months) return(NULL)
-  fit <- lm(ly ~ moy + x, base)
-  d |>
-    filter(as.character(moy) %in% as.character(base$moy)) |>
-    mutate(anom = ly - predict(fit, newdata = pick(everything())), station = !!station) |>
-    select(station, month_start, anom) |>
-    time_cols()
-})
+# covariate: "own" = the station's nearest flow gauge (the default; a month is lost when that gauge has no
+# data), "vernalis" = Vernalis flow (always available), "none" = calendar month only.
+make_anoms <- function(covariate = "own") {
+  pmap_dfr(stations_tbl, function(station, gauge, role) {
+    d <- monthly_turb |> filter(station == !!station)
+    if (covariate != "none") d <- inner_join(d, monthly_flow(if (covariate == "own") gauge else "VNS"), by = "month_start")
+    d <- mutate(d, ly = log10(turb), moy = factor(month(month_start), levels = 1:12))
+    base <- filter(d, month_start < detect)
+    if (nrow(base) < min_baseline_months) return(NULL)
+    fit <- lm(if (covariate == "none") ly ~ moy else ly ~ moy + x, base)
+    d |>
+      filter(as.character(moy) %in% as.character(base$moy)) |>
+      mutate(anom = ly - predict(fit, newdata = pick(everything())), station = !!station) |>
+      select(station, month_start, anom) |>
+      time_cols()
+  })
+}
+anoms <- make_anoms("own")
 
 cat("Months with data per station: baseline (before", format(detect), ") and since:\n")
 anoms |> group_by(station) |>
@@ -114,8 +118,8 @@ by_station |> show_effect() |>
   select(station, effect_pct, lo_pct, hi_pct, p, trend_pct_per_year, ar1, post_months) |> print(n = Inf)
 
 # 2. Groups
-group_series <- function(members) {
-  anoms |> filter(station %in% members) |> group_by(month_start) |>
+group_series <- function(members, a = anoms) {
+  a |> filter(station %in% members) |> group_by(month_start) |>
     summarise(stations = n(), anom = mean(anom), .groups = "drop") |>
     filter(stations >= ceiling(length(members) / 2)) |> time_cols()
 }
@@ -164,6 +168,38 @@ its(delta_s, c("t", "post_DJF", "post_MAM", "post_JJA", "post_SON")) |> show_eff
   mutate(season = sub("post_", "", term),
          months_in_season = map_int(season, ~ sum(delta_s$post == 1 & delta_s$season == .x))) |>
   select(season, months_in_season, effect_pct, lo_pct, hi_pct, p) |> print()
+
+# 5. Does the flow covariate matter, and what does dropping the flow-gauge gaps do? --------------------------------
+# The tidal flow gauges (PRI, TRN, OSJ, MOK) have no data for months in winter 2025-26, which removes those
+# months from the Delta series above. This compares how much each covariate adds to the baseline fit
+# (adjusted R-squared of log10 monthly turbidity) and repeats the Delta step with Vernalis flow or no flow term.
+base_fit <- map_dfr(seq_len(nrow(stations_tbl)), function(i) {
+  st <- stations_tbl$station[i]; g <- stations_tbl$gauge[i]
+  d <- monthly_turb |> filter(station == st, month_start < detect) |>
+    inner_join(rename(monthly_flow(g), x_own = x), by = "month_start") |>
+    inner_join(rename(monthly_flow("VNS"), x_vns = x), by = "month_start") |>
+    mutate(ly = log10(turb), moy = factor(month(month_start)))
+  if (nrow(d) < min_baseline_months) return(NULL)
+  r2 <- function(f) round(summary(lm(f, d))$adj.r.squared, 2)
+  tibble(station = st, months = nrow(d), month_only = r2(ly ~ moy), plus_own_flow = r2(ly ~ moy + x_own),
+         plus_vernalis_flow = r2(ly ~ moy + x_vns))
+})
+cat("\nAdjusted R-squared of the baseline model of monthly turbidity:\n")
+base_fit |> mutate(station = factor(station, levels = station_order)) |> arrange(station) |> print(n = Inf)
+
+covariate_runs <- map_dfr(c("own", "vernalis", "none"), function(cv) {
+  a <- make_anoms(cv)
+  d <- group_series(groups[["Delta (all 7)"]], a)
+  winter_post <- sum(d$month_start >= detect & month(d$month_start) %in% c(12, 1, 2, 3))
+  bind_rows(
+    mutate(its(d, c("t", "post")), start = "2024-10"),
+    mutate(its(mutate(d, post_scan = as.numeric(month_start >= ymd("2025-04-01"))), c("t", "post_scan")), start = "2025-04 (exploratory)")
+  ) |> mutate(covariate = cv, post_months_in_series = sum(d$month_start >= detect), winter_post_months = winter_post)
+})
+cat("\nDelta (all 7) step by flow covariate used for the baseline expectation:\n")
+covariate_runs |> show_effect() |>
+  select(covariate, start, post_months_in_series, winter_post_months, effect_pct, lo_pct, hi_pct, p, trend_pct_per_year) |>
+  print(n = Inf, width = Inf)
 
 # Figure ------------------------------------------------------------------------------------------------------------------
 fits <- map_dfr(names(groups), function(g) {
