@@ -27,6 +27,7 @@ settings = {
     "rgb_rhot": False,
     "rgb_rhos": False,
     "map_l2w": False,
+    "l1r_delete_netcdf": True,                       # the 200 MB L1R intermediate is not needed after the run
 }
 # Optional fourth argument "radcor" switches the atmospheric correction to RAdCor (Castagna and Vanhellemont 2025),
 # which includes a correction for adjacency effects from land around narrow channels. The default (as in

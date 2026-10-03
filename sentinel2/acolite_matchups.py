@@ -31,15 +31,25 @@ RADII = (100, 200, 400)
 MIN_PIXELS = 5
 
 
+def rhos_band(ds, wave):
+    """Surface reflectance band closest to `wave` nm. ACOLITE names bands by the sensor's own centre wavelength
+    (for example 559 nm on Sentinel-2B but 560 nm on 2A and 2C), so the name differs between satellites."""
+    names = [k for k in ds.variables if k.startswith("rhos_")]
+    best = min(names, key=lambda k: abs(int(k.split("_")[1]) - wave))
+    if abs(int(best.split("_")[1]) - wave) > 15:
+        raise KeyError(f"no rhos band within 15 nm of {wave} in {list(names)}")
+    return ds[best][:].filled(np.nan)
+
+
 def main(outdir):
     rows = []
     for f in sorted(glob.glob(os.path.join(outdir, "*_L2R.nc"))):
         ds = Dataset(f)
         lat, lon = ds["lat"][:].filled(np.nan), ds["lon"][:].filled(np.nan)
-        rhos = {k: ds[k][:].filled(np.nan) for k in ["rhos_559", "rhos_665", "rhos_833"]}
-        ndwi = (rhos["rhos_559"] - rhos["rhos_833"]) / (rhos["rhos_559"] + rhos["rhos_833"])
-        water = (ndwi > 0) & (rhos["rhos_833"] < 0.05) & (rhos["rhos_665"] > 0)
-        tur = nechad(rhos["rhos_665"])
+        green, red, nir = (rhos_band(ds, w) for w in (560, 665, 833))
+        ndwi = (green - nir) / (green + nir)
+        water = (ndwi > 0) & (nir < 0.05) & (red > 0)
+        tur = nechad(red)
         stamp = pd.Timestamp(ds.getncattr("isodate")).tz_localize(None)
         date = stamp.strftime("%Y-%m-%d")
         t_pst = stamp - pd.Timedelta(hours=8)
@@ -58,6 +68,8 @@ def main(outdir):
                 row[f"s2_{r}m"] = float(np.nanmedian(tur[m])) if m.sum() >= MIN_PIXELS else np.nan
             rows.append(row)
     df = pd.DataFrame(rows)
+    # A station inside the overlap of two tiles appears twice on a date: keep the row with more water pixels around it
+    df = df.sort_values("n200", ascending=False).drop_duplicates(["date", "station"]).sort_values(["date", "station"]).reset_index(drop=True)
     df.to_csv(os.path.join(outdir, "acolite_matchups.csv"), index=False)
     print("\n" + df.round(2).to_string(index=False))
     for r in RADII:
@@ -67,6 +79,27 @@ def main(outdir):
             print(f"\nradius {r} m: n={len(ok)}  Spearman={ok[[f's2_{r}m', 'sonde']].corr(method='spearman').iloc[0, 1]:.2f}  "
                   f"R2={np.corrcoef(x, y)[0, 1] ** 2:.2f}  median ratio S2/sonde={np.median(x / y):.2f}  "
                   f"median bias={np.median(x - y):.1f}  median abs % error={100 * np.median(np.abs(x / y - 1)):.0f}%")
+    # Does the satellite track the sondes across dates (not just across stations)? Radius 200 m.
+    col = "s2_200m"
+    ok = df.dropna(subset=[col, "sonde"]).assign(year=lambda x: x["date"].str.slice(0, 4).astype(int),
+                                                 ls2=lambda x: np.log10(x[col]), lso=lambda x: np.log10(x["sonde"]))
+    if ok["date"].nunique() >= 3:
+        print(f"\n--- cross-date checks (radius 200 m; {ok['date'].nunique()} dates) ---")
+        print("median ratio S2/sonde by year (is the bias stable?):")
+        print(ok.groupby("year").apply(lambda x: pd.Series({"pairs": len(x), "ratio": 10 ** np.median(x["ls2"] - x["lso"])}),
+                                       include_groups=False).round(2).to_string())
+        within = ok.assign(a2=ok["ls2"] - ok.groupby("station")["ls2"].transform("mean"),
+                           ao=ok["lso"] - ok.groupby("station")["lso"].transform("mean"))
+        print(f"\ndate-to-date tracking within stations (anomalies from each station's own mean, log10): "
+              f"Pearson={within['a2'].corr(within['ao']):.2f}, Spearman={within['a2'].corr(within['ao'], method='spearman'):.2f}, n={len(within)}")
+        base_year = ok["year"].min()
+        late = ok[ok["year"] > base_year].groupby("station")[["ls2", "lso"]].mean()
+        early = ok[ok["year"] == base_year].groupby("station")[["ls2", "lso"]].mean()
+        chg = (late - early).dropna()
+        if len(chg) >= 4:
+            print(f"\nchange from {base_year} to the later years, per station, in log10 (+ve = more turbid later); "
+                  f"satellite vs sonde: Pearson={chg['ls2'].corr(chg['lso']):.2f}, n={len(chg)}")
+            print((100 * (10 ** chg - 1)).round(0).rename(columns={"ls2": "S2 % change", "lso": "sonde % change"}).to_string())
 
 
 if __name__ == "__main__":
