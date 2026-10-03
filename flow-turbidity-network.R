@@ -2,8 +2,8 @@
 # and is 2025 unusual at any station once flow is accounted for?
 #
 # Ten stations with continuous turbidity, each paired with its nearest CDEC flow gauge (table
-# below). Each station's turbidity goes through qc_single_sonde() (RRI uses the three-depth
-# pipeline in turbidity-depth-RRI.R); daily medians are compared with daily flow.
+# below). Each station's turbidity comes from the stored QC (run-qc.R; RRI uses the three-depth
+# pipeline in R/rri_multidepth_qc.R); daily medians are compared with daily flow.
 #
 # Flow gauges (data/CDEC_*): VNS and MSD are daily means. SJJ, PRI, TRN, OSJ and MOK are
 # tidal 15-minute flow, Godin-filtered to a daily net flow (see R/flow_functions.R). The
@@ -32,6 +32,8 @@ library(here)
 
 source(here("R", "qc_functions.R"))
 source(here("R", "station_qc.R"))
+source(here("R", "rri_multidepth_qc.R"))
+source(here("R", "mussel_analysis.R"))
 source(here("R", "flow_functions.R"))
 
 first_post_year <- 2025
@@ -58,51 +60,13 @@ stations_tbl <- tribble(
 station_order <- stations_tbl$station
 
 # Turbidity ----------------------------------------------------------------------------------------
-tidal_cond <- modifyList(param_limits, list(spcond_uscm = c(20, 30000)))
-station_limits <- list(SJR = param_limits, MSD = param_limits, PPT = param_limits, TRN = param_limits,
-                       MOK = param_limits, OSJ = param_limits, TWI = tidal_cond, ANH = tidal_cond, BLP = tidal_cond)
-
-daily_median <- function(df, value) {
-  df |>
-    mutate(date = as_date(date_time)) |>
-    group_by(date) |>
-    summarise(turb = if (sum(!is.na(.data[[value]])) >= min_valid_readings_per_day)
-                       median(.data[[value]], na.rm = TRUE) else NA_real_, .groups = "drop")
-}
-
+# The QC is separate: run-qc.R stores the QC'd single-sonde stations in data/qc/ and rri_qc_final() the RRI
+# three-depth record (the one special case). build_daily_turbidity() (R/mussel_analysis.R) leaves out the
+# flagged readings and takes daily medians. Rerun run-qc.R first if a data file or QC setting changed.
 if (!exists("daily")) {
-  if (!exists("wq_qc_final")) source(here("turbidity-depth-RRI.R"))
-  qc_summary <- list()
-  single <- imap(station_limits, function(lim, s) {
-    extra <- if (use_cdec_2026) here("data", paste0("CDEC_", s, "_turb_2026.csv")) else character()
-    qc <- qc_single_sonde(here("data", paste0(s, "_data.csv")), lim, extra)
-    qc_summary[[s]] <<- tibble(station = s, pct_valid = round(100 * mean(qc$qaqc_flag == "Valid", na.rm = TRUE), 1),
-                               first = as_date(min(qc$date_time[!is.na(qc$turb_fnu)])),
-                               readings_with_turbidity = sum(!is.na(qc$turb_fnu)))
-    daily_median(qc, "turb_fnu_analysis") |> mutate(station = s)
-  })
-  if (use_cdec_2026) {
-    # 1 m series: the sonde record, extended with the CDEC 1 m download (same ceiling as the sondes)
-    last_sonde <- max(wq_qc_final$date_time)
-    rri_2026 <- qc_station_data(read_station_file(here("data", "CDEC_RRI_turb_2026.csv")), param_limits) |>
-      filter(date_time > last_sonde) |>
-      prepare_analysis_turbidity()
-    rri <- bind_rows(filter(wq_qc_final, depth_m == 1), rri_2026) |>
-      daily_median("turb_fnu_analysis") |>
-      mutate(station = "RRI")
-  } else {
-    rri <- wq_qc_final |>
-      group_by(depth_m) |>
-      group_modify(~ daily_median(.x, "turb_fnu_analysis")) |>
-      group_by(date) |>
-      summarise(turb = if (sum(!is.na(turb)) >= 2) median(turb, na.rm = TRUE) else NA_real_, .groups = "drop") |>
-      mutate(station = "RRI")
-  }
-  daily <- bind_rows(bind_rows(single), rri) |>
-    filter(!is.na(turb), turb > 0) |>
-    mutate(station = factor(station, levels = station_order))
+  daily <- build_daily_turbidity(station_order, use_cdec_2026, min_valid_readings_per_day)
   cat("QC outcome for the single-sonde stations:\n")
-  print(bind_rows(qc_summary))
+  print(attr(daily, "qc_summary"))
 }
 
 # Flow ------------------------------------------------------------------------------------------------

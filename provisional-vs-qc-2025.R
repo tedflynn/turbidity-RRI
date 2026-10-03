@@ -16,8 +16,10 @@ library(here)
 
 source(here("R", "qc_functions.R"))
 source(here("R", "station_qc.R"))
+source(here("R", "rri_multidepth_qc.R"))
+source(here("R", "mussel_analysis.R"))
 if (!exists("daily")) source(here("flow-turbidity-network.R"))
-if (!exists("wq_qc_final")) source(here("turbidity-depth-RRI.R"))
+if (!exists("wq_qc_final")) wq_qc_final <- rri_qc_final()
 
 stations <- c("SJR", "MSD", "RRI", "PPT", "TWI", "BLP", "ANH", "TRN", "OSJ", "MOK")
 tidal_cond <- modifyList(param_limits, list(spcond_uscm = c(20, 30000)))
@@ -59,7 +61,7 @@ daily_median <- function(df, value) {
 }
 cdec_daily <- map_dfr(stations, function(s) {
   q <- qc_station_data(read_station_file(here("data", paste0("CDEC_", s, "_turb_2025.csv"))) |> in_2025(), limits_for(s))
-  if (s == "RRI") q <- prepare_analysis_turbidity(q)
+  q <- prepare_analysis_turbidity(q, ceiling = if (s == "RRI") 100 else Inf)   # the summer ceiling applies to RRI only
   mutate(daily_median(q, "turb_fnu_analysis"), station = s)
 })
 qcd_daily <- daily |> filter(year(date) == 2025) |> mutate(station = as.character(station))

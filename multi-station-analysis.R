@@ -2,7 +2,7 @@
 # summer turbidity at RRI after the Golden Mussel detection unusual given upstream conditions?
 #
 # Stations, upstream to downstream: SJR (Vernalis), MSD (Mossdale), RRI (Stockton), TWI
-# (Twitchell Island), ANH (Antioch). RRI comes from turbidity-depth-RRI.R (three depths);
+# (Twitchell Island), ANH (Antioch). RRI comes from rri_qc_final() in R/rri_multidepth_qc.R (three depths);
 # the others are single-sonde files in data/ and go through qc_single_sonde().
 # Flow comes from CDEC, downloaded with
 #   https://cdec.water.ca.gov/dynamicapp/req/CSVDataServlet?Stations=<id>&SensorNums=<n>&dur_code=<D or E>&Start=2005-07-01&End=<today>
@@ -27,7 +27,9 @@ library(here)
 source(here("R", "qc_functions.R"))
 source(here("R", "station_qc.R"))
 source(here("R", "flow_functions.R"))
-if (!exists("wq_qc_final")) source(here("turbidity-depth-RRI.R"))
+source(here("R", "rri_multidepth_qc.R"))
+source(here("R", "mussel_analysis.R"))
+if (!exists("wq_qc_final")) wq_qc_final <- rri_qc_final()
 
 first_post_year <- 2025            # first summer after the detection (assumed Oct 2024; adjust if needed)
 early_years <- 2008:2010           # dropped in the second baseline
@@ -42,7 +44,8 @@ station_limits <- list(
   TWI = modifyList(param_limits, list(spcond_uscm = c(20, 30000))),
   ANH = modifyList(param_limits, list(spcond_uscm = c(20, 30000)))
 )
-stations <- imap(station_limits, ~ qc_single_sonde(here("data", paste0(.y, "_data.csv")), .x))
+stations <- imap(station_limits, ~ qc_single_sonde(here("data", paste0(.y, "_data.csv")), .x) |>
+                   prepare_analysis_turbidity(ceiling = Inf))
 
 # Daily turbidity per station (median of the analysis column) ----------------------------------------
 daily_median <- function(df, value) {

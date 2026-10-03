@@ -6,6 +6,13 @@
 # Each function below is one step of the pipeline and returns the input data
 # frame with new columns added (nothing is dropped), so you can inspect the
 # result of each step before moving to the next.
+#
+# These steps work on one sonde at a time (a data frame with station, depth_m,
+# date_time and the parameter columns; depth_m is just a grouping key and is 1
+# for a station with one sonde). Project-specific decisions are kept out of
+# here: the three-depth RRI steps are in R/rri_multidepth_qc.R and the choice
+# of which flagged readings to leave out of the clarity comparison is in
+# R/mussel_analysis.R. R/station_qc.R chains these steps for any station file.
 
 # Helper: TRUE for every row within +/- pad rows of a TRUE in `flag`. Uses a
 # cumulative-sum window difference so it stays fast on ~600k-row series.
@@ -116,63 +123,6 @@ flag_erratic_periods <- function(df, window = 48, jump_thresh = 5) {
     ungroup()
 }
 
-# Step 2c: Cross-depth drift detection --------------------------------------
-# Biofouling shows up as a slow one-sensor climb (e.g. 1m rising from ~9 to
-# 73 FNU over Sept 27-Oct 2 2018, then resetting at a service visit) that
-# steps 2 and 2b can't see: no spikes, and the local baseline just follows
-# the ramp. All three sondes share one housing, so each depth's 24 hr median
-# level is compared with the mean of the other depths' levels. A depth is
-# flagged when it stays more than `diff_thresh` FNU AND `ratio_thresh` times
-# above them for at least `min_readings` in a row (96 = 24 hrs), with a buffer
-# of `pad_readings` (96 = 24 hrs) either side to catch the ramp-up. Upward
-# only: fouling reads high. level_24h/other_level_24h are kept for inspection.
-# Defaults (8 FNU, 3x) were chosen so steady season-long offsets between depths
-# (e.g. 1m ~10 vs ~5 FNU in summer 2009-2010, 6m ~18 FNU in 2011, with
-# chlorophyll unchanged) count as normal depth differences, not drift; at the
-# looser 5 FNU / 2x they would exclude 30-47% of those summers.
-flag_depth_drift <- function(df, window = 48, diff_thresh = 8, ratio_thresh = 3,
-                             min_readings = 96, pad_readings = 96) {
-  lev <- df |>
-    group_by(depth_m) |>
-    arrange(date_time, .by_group = TRUE) |>
-    mutate(level_24h = slide_dbl(turb_fnu_qc, median, na.rm = TRUE, .before = window, .after = window)) |>
-    ungroup()
-
-  wide <- lev |>
-    select(date_time, depth_m, level_24h) |>
-    pivot_wider(names_from = depth_m, values_from = level_24h, names_prefix = "lvl_")
-  lvl_cols <- grep("^lvl_", names(wide), value = TRUE)
-
-  other <- map_dfr(sort(unique(lev$depth_m)), function(d) {
-    m <- rowMeans(wide[setdiff(lvl_cols, paste0("lvl_", d))], na.rm = TRUE)
-    tibble(date_time = wide$date_time, depth_m = d, other_level_24h = if_else(is.nan(m), NA_real_, m))
-  })
-
-  lev |>
-    left_join(other, by = c("date_time", "depth_m")) |>
-    group_by(depth_m) |>
-    arrange(date_time, .by_group = TRUE) |>
-    mutate(
-      candidate = !is.na(level_24h) & !is.na(other_level_24h) &
-        (level_24h - other_level_24h) > diff_thresh &
-        level_24h / other_level_24h > ratio_thresh,
-      run_id = consecutive_id(candidate)
-    ) |>
-    group_by(depth_m, run_id) |>
-    mutate(sustained = candidate & n() >= min_readings) |>
-    group_by(depth_m) |>
-    mutate(
-      in_drift = near_flag(sustained, pad_readings),
-      drift_flag = case_when(
-        is.na(turb_fnu_qc) ~ NA_character_,
-        in_drift ~ "Fail: Depth Drift",
-        TRUE ~ "Pass"
-      )
-    ) |>
-    ungroup() |>
-    select(-candidate, -run_id, -sustained, -in_drift)
-}
-
 # Step 2d: Flat-line (stuck sensor) detection ----------------------------------
 # A sensor that stops updating repeats one value. At 0.1 FNU resolution, short
 # repeats are normal in clear water (runs of 6-9 identical readings at 1-6 FNU
@@ -195,61 +145,6 @@ flag_flat_lines <- function(df, min_run = 12, pad_readings = 24) {
     ) |>
     ungroup() |>
     select(-run_id, -is_flat)
-}
-
-# Step 2e: Cross-depth drift check for another parameter (used for pH) ---------
-# Same idea as step 2c, but built for a bounded, roughly symmetric variable
-# like pH. Each depth's 24 hr median level is compared with the MEDIAN of all
-# three depths' levels (not the mean of the other two): when one sensor fails,
-# the median stays with the two healthy sensors, so the blame lands on the odd
-# one out instead of spreading to its neighbors. Needs all three depths present.
-# Two-sided. A depth is flagged when its level differs from the reference by
-# more than `diff_thresh` (the parameter's own units) AND, if `ratio_thresh` > 1,
-# by more than that multiplicative factor, for `min_readings` in a row (192 =
-# 48 hrs), plus `pad_readings` (48 = 12 hrs) either side. Thresholds are set
-# beyond the 99th percentile of normal depth-to-depth differences (some real
-# stratification exists: 1m runs ~0.5 C and ~0.7 mg/L DO above 6m at the 95th
-# percentile). Settings used for each parameter are in turbidity-depth-RRI.R.
-# Adds <prefix>_level_24h, <prefix>_ref_24h, <prefix>_drift_flag.
-flag_param_depth_drift <- function(df, param = "ph_qc", prefix = "ph", diff_thresh = 0.5,
-                                   ratio_thresh = 1, window = 48, min_readings = 192,
-                                   pad_readings = 48) {
-  lev <- df |>
-    group_by(depth_m) |>
-    arrange(date_time, .by_group = TRUE) |>
-    mutate(.lvl = slide_dbl(.data[[param]], median, na.rm = TRUE, .before = window, .after = window)) |>
-    ungroup()
-
-  wide <- lev |>
-    select(date_time, depth_m, .lvl) |>
-    pivot_wider(names_from = depth_m, values_from = .lvl, names_prefix = "d")
-  a <- wide[[2]]; b <- wide[[3]]; c <- wide[[4]]
-  ref <- pmax(pmin(a, b), pmin(pmax(a, b), c))   # median of three; NA if any is NA
-  ref_tbl <- tibble(date_time = wide$date_time, .ref = ref)
-
-  out <- lev |>
-    left_join(ref_tbl, by = "date_time") |>
-    group_by(depth_m) |>
-    arrange(date_time, .by_group = TRUE) |>
-    mutate(
-      candidate = !is.na(.lvl) & !is.na(.ref) & abs(.lvl - .ref) > diff_thresh &
-        pmax(.lvl, .ref) / pmax(pmin(.lvl, .ref), 1e-6) > ratio_thresh,
-      run_id = consecutive_id(candidate)
-    ) |>
-    group_by(depth_m, run_id) |>
-    mutate(sustained = candidate & n() >= min_readings) |>
-    group_by(depth_m) |>
-    mutate(
-      in_drift = near_flag(sustained, pad_readings),
-      .flag = case_when(is.na(.data[[param]]) ~ NA_character_, in_drift ~ "Fail: Depth Drift", TRUE ~ "Pass")
-    ) |>
-    ungroup() |>
-    select(-candidate, -run_id, -sustained, -in_drift)
-
-  names(out)[names(out) == ".lvl"] <- paste0(prefix, "_level_24h")
-  names(out)[names(out) == ".ref"] <- paste0(prefix, "_ref_24h")
-  names(out)[names(out) == ".flag"] <- paste0(prefix, "_drift_flag")
-  out
 }
 
 # Step 3: Duration-aware classification ----------------------------------
@@ -307,91 +202,27 @@ corroborate_sustained_excursions <- function(df, window = 12, corrob_z_thresh = 
   df |> left_join(run_corrob, by = c("depth_m", "run_id"))
 }
 
-# Step 4b: Cross-depth corroboration ---------------------------------------
-# All three sondes share one housing at this site, so a real water-column
-# event (vessel-wake resuspension, a storm) should register in turbidity at
-# the other depths too, even when it doesn't move conductivity or DO. A
-# disturbance confined to one depth's sensor is a stronger single-sensor-
-# artifact signal. Reuses the per-depth modified_z from step 2 -- no new
-# rolling-window computation needed.
-# pad_readings extends the comparison window a bit on each side (in units of
-# 15-min readings) to allow for a short lag between depths.
-corroborate_cross_depth <- function(df, z_thresh = 3.5, pad_readings = 1) {
-  z_wide <- df |>
-    select(date_time, depth_m, modified_z) |>
-    arrange(date_time) |>
-    pivot_wider(names_from = depth_m, values_from = modified_z, names_prefix = "z_depth_")
-
-  # Timestamps are a confirmed regular 15-min grid, so a run's row range in
-  # z_wide can be found by index arithmetic instead of a per-run table scan.
-  t0 <- min(z_wide$date_time)
-  idx_of <- function(t) as.integer(round(as.numeric(difftime(t, t0, units = "mins")) / 15)) + 1L
-
-  runs <- df |>
-    filter(duration_class == "Sustained Excursion") |>
-    group_by(depth_m, run_id) |>
-    summarise(start = min(date_time), end = max(date_time), .groups = "drop")
-
-  depth_cols <- paste0("z_depth_", sort(unique(df$depth_m)))
-
-  runs$depth_corroborated <- purrr::pmap_lgl(runs, function(depth_m, run_id, start, end) {
-    i0 <- max(1L, idx_of(start) - pad_readings)
-    i1 <- min(nrow(z_wide), idx_of(end) + pad_readings)
-    other_cols <- setdiff(depth_cols, paste0("z_depth_", depth_m))
-    vals <- unlist(z_wide[i0:i1, other_cols])
-    any(abs(vals) > z_thresh, na.rm = TRUE)
-  })
-
-  df |> left_join(runs |> select(depth_m, run_id, depth_corroborated), by = c("depth_m", "run_id"))
-}
-
-# Step 6: Analysis-ready turbidity ------------------------------------------
-# Builds turb_fnu_analysis for the summer clarity comparison, leaving
-# turb_fnu_final untouched. Excludes (1) points flagged for review above and
-# (2) any summer reading above `ceiling` FNU together with a buffer of
-# `pad_readings` (24 = 6 hrs) on each side, so the ramp-up and decay of the
-# same event go with it. The ceiling is a judgment call, not a sensor limit:
-# summer turbidity here is normally <30 FNU (99th percentile 17-26), so
-# readings above 100 are treated as transient disturbances (vessel wake,
-# dredging, instrument problems) rather than ambient clarity. analysis_exclusion
-# records why each point was dropped.
-prepare_analysis_turbidity <- function(df, ceiling = 100, pad_readings = 24, months = 7:9) {
-  df |>
-    group_by(depth_m) |>
-    arrange(date_time, .by_group = TRUE) |>
-    mutate(
-      high_hit = !is.na(turb_fnu_final) & turb_fnu_final > ceiling & month %in% months,
-      in_high_episode = month %in% months & near_flag(high_hit, pad_readings),
-      analysis_exclusion = case_when(
-        qaqc_flag %in% c("Flagged: Uncorroborated Excursion (review)",
-                         "Flagged: Erratic Period (review)",
-                         "Flagged: Depth Drift (review)",
-                         "Flagged: Flat Line (review)") ~ qaqc_flag,
-        in_high_episode ~ paste0("Summer episode > ", ceiling, " FNU"),
-        TRUE ~ NA_character_
-      ),
-      turb_fnu_analysis = if_else(is.na(analysis_exclusion), turb_fnu_final, NA_real_)
-    ) |>
-    ungroup() |>
-    select(-high_hit, -in_high_episode)
-}
-
 # Step 5: Final QC decision -----------------------------------------------
 # Gross-range failures and isolated spikes are near-certain glitches, so
 # those are removed (set to NA). A sustained excursion counts as
-# corroborated if EITHER another channel (step 4) OR another depth
-# (step 4b) shows a coincident signal; only excursions confined to a single
-# depth's turbidity reading alone are flagged for manual review rather than
-# removed, since deleting a real event (storm, vessel-wake resuspension)
-# would bias downstream analysis.
+# corroborated if another channel (step 4) shows a coincident signal; only
+# excursions confined to the turbidity reading alone are flagged for manual
+# review rather than removed, since deleting a real event (storm, vessel-wake
+# resuspension) would bias downstream analysis.
+# Stations with sondes at several depths (RRI) add two inputs from
+# R/rri_multidepth_qc.R: drift_flag (one depth drifting away from the others)
+# and depth_corroborated (the excursion also shows at the other depths, which
+# counts as corroboration). Without those columns they are ignored.
 finalize_qc_flags <- function(df) {
+  depth_drift <- if ("drift_flag" %in% names(df)) df$drift_flag else NA_character_
+  depth_corr <- if ("depth_corroborated" %in% names(df)) df$depth_corroborated else FALSE
   df |>
     mutate(
-      any_corroborated = run_corroborated | depth_corroborated,
+      any_corroborated = run_corroborated | .env$depth_corr,
       qaqc_flag = case_when(
         gross_range_flag == "Fail: Gross Range" ~ "Removed: Gross Range",
         erratic_flag == "Fail: Erratic Period" ~ "Flagged: Erratic Period (review)",
-        drift_flag == "Fail: Depth Drift" ~ "Flagged: Depth Drift (review)",
+        .env$depth_drift == "Fail: Depth Drift" ~ "Flagged: Depth Drift (review)",
         flat_flag == "Fail: Flat Line" ~ "Flagged: Flat Line (review)",
         duration_class == "Isolated Spike" ~ "Removed: Isolated Spike",
         duration_class == "Sustained Excursion" & !any_corroborated ~ "Flagged: Uncorroborated Excursion (review)",

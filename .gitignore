@@ -62,3 +62,9 @@ plots/*.png
 # Sentinel-2 chips and scenes
 data/s2/
 __pycache__/
+
+# Stored QC output (rerun run-qc.R to rebuild)
+data/qc/
+
+# Stray R graphics device output
+Rplots.pdf

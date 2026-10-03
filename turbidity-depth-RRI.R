@@ -1,140 +1,23 @@
-# Load required packages
+# RRI summer turbidity by depth: the QC'd three-depth record and its visual screen.
+#
+# The QC itself is in R/rri_multidepth_qc.R (the general steps in R/qc_functions.R plus the cross-depth
+# steps that only apply to RRI's 1, 3 and 6 m sondes). rri_qc_final() runs it, or reads the cached
+# result in data/qc/; use rri_qc_final(refresh = TRUE) after changing a data file or a QC setting.
+# Output column meanings: qaqc_flag is the QC decision for each reading, turb_fnu_final is turbidity with
+# gross-range failures and isolated spikes removed, and turb_fnu_analysis additionally leaves out
+# flagged-for-review readings and summer episodes above 100 FNU (analysis_exclusion records why).
 library(tidyverse)
 library(lubridate)
 library(here)
 library(slider)
-library(oddwater)
-library(imputeTS)
 
-# Import sonde data ------------------------------------------------------------
-# Data was QC's and provided by Andrew Tran in C-EMP 
-df_1m <- read_csv(here("data","RRI_data_1m.csv")) |> mutate(depth_m = 1)
-df_3m <- read_csv(here("data","RRI_data_3m.csv")) |> mutate(depth_m = 3) 
-df_6m <- read_csv(here("data","RRI_data_6m.csv")) |> mutate(depth_m = 6)
-
-# Combine data from all three depths
-wq_data <- bind_rows(df_1m, df_3m, df_6m)
-
-# Add temporal and water year type data
-wq_data <- wq_data |>
-  mutate(
-    # The raw strings carry a "-08:00" suffix, but the clock values are really UTC:
-    # daily temperature/DO/pH cycles, field-sheet exchange times and EMP grab samples
-    # all line up only after subtracting 8 hours. read_csv() parses the string clock
-    # as if it were PST, so shift back 8 h, then express in fixed PST (no DST).
-    date_time = with_tz(date_time - hours(8), tzone = "Etc/GMT+8"),
-    year = year(date_time),
-    month = month(date_time),
-    day = day(date_time),
-    water_year = if_else(month >= 10, year + 1, year)
-    # water year begins October 1st
-  )
-
-# Add table of WY types downloaded from CDEC and select SJR version
-sj_wy_types <- read_csv(here("data","WY-type.csv")) |> 
-  select("Year","Yr-type-SJR") |> 
-  rename("wy_type" = "Yr-type-SJR") |> 
-  rename("water_year" = "Year")
-
-# Join WY metadata with main data frame
-wq_data <- wq_data |>
-  left_join(sj_wy_types, by = "water_year") |>
-  # Set factors so graphs plot in logical wetness order rather than alphabetical
-  mutate(wy_type = factor(wy_type, levels = c("W", "AN", "BN", "D", "C")))
-
-# Basic data QC
-# Remove any erroneous negative sonde turbidity readings
-wq_clean <- wq_data |> filter(turb_fnu >= 0 | is.na(turb_fnu))
-
-# Secondary (automated) QC -------------------------------------------------
-# Field-based primary QC (Wagner et al. 2006 method) has already been applied
-# upstream. These steps catch residual statistical outliers. Each step adds
-# columns without dropping rows, so you can inspect wq_qc1, wq_qc2, etc.
-# individually before trusting the final result. See R/qc_functions.R for
-# the method behind each step and its tunable thresholds.
 source(here("R", "qc_functions.R"))
+source(here("R", "rri_multidepth_qc.R"))
+source(here("R", "mussel_analysis.R"))     # prepare_analysis_turbidity(), used inside rri_qc_final()
 
-# Step 1: gross/physical range check
-wq_qc1 <- check_gross_range(wq_clean, min_val = 0, max_val = 4000)
-wq_qc1 |> count(gross_range_flag)
-
-# Step 1b: range screen for temperature, pH, conductivity, DO and chlorophyll
-# (impossible values -> NA in <param>_qc columns; limits in param_limits)
-wq_qc1 <- check_param_ranges(wq_qc1)
-wq_qc1 |>
-  pivot_longer(starts_with("range_flag_"), names_to = "param", values_to = "flag") |>
-  count(param, depth_m, flag) |> filter(flag == "Fail: Range")
-
-# Step 2: robust local outlier detection (modified z-score on rolling median/MAD)
-wq_qc2 <- flag_robust_outliers(wq_qc1, window = 12, z_thresh = 3.5, noise_floor = 5)
-wq_qc2 |> count(spike_flag)
-
-# Step 2b: flag erratic periods (sustained disturbances longer than step 2's
-# rolling window, which it can't see). Flagged for review, not removed.
-wq_qc2b <- flag_erratic_periods(wq_qc2, window = 48, jump_thresh = 5)
-wq_qc2b |> count(depth_m, erratic_flag)
-
-# Step 2c: flag cross-depth drift (one sensor climbing away from the other two,
-# e.g. biofouling that resets at a service visit). Flagged for review, not removed.
-wq_qc2c <- flag_depth_drift(wq_qc2b, diff_thresh = 8, ratio_thresh = 3)
-wq_qc2c |> count(depth_m, drift_flag)
-
-# Step 2d: flag flat lines (12+ identical readings in a row = stuck sensor).
-# Flagged for review, not removed.
-wq_qc2d <- flag_flat_lines(wq_qc2c, min_run = 12, pad_readings = 24)
-wq_qc2d |> count(depth_m, flat_flag)
-
-# Step 2e: flag each of the other parameters drifting away from the other two
-# depths (24 hr median vs the median of all three depths, sustained 48+ hrs).
-# Adds <prefix>_drift_flag columns for any analysis of those parameters; this
-# does not change turbidity decisions. Thresholds sit beyond the 99th percentile
-# of normal depth-to-depth differences (see flag_param_depth_drift()).
-drift_settings <- list(
-  ph   = list(param = "ph_qc",          diff_thresh = 0.5, ratio_thresh = 1),
-  temp = list(param = "watertemp_c_qc", diff_thresh = 1.0, ratio_thresh = 1),
-  cond = list(param = "spcond_uscm_qc", diff_thresh = 100, ratio_thresh = 1.25),
-  do   = list(param = "do_mgl_qc",      diff_thresh = 1.5, ratio_thresh = 1),
-  chl  = list(param = "chlor_ugl_qc",   diff_thresh = 5,   ratio_thresh = 2)
-)
-wq_qc2e <- wq_qc2d
-for (p in names(drift_settings)) {
-  s <- drift_settings[[p]]
-  wq_qc2e <- flag_param_depth_drift(wq_qc2e, param = s$param, prefix = p,
-                                    diff_thresh = s$diff_thresh, ratio_thresh = s$ratio_thresh)
-}
-wq_qc2e |>
-  pivot_longer(ends_with("_drift_flag") & !starts_with("drift"), names_to = "param", values_to = "flag") |>
-  count(param, depth_m, flag) |> filter(flag == "Fail: Depth Drift")
-
-# Step 3: classify flagged points as isolated spikes vs sustained excursions
-wq_qc3 <- classify_run_duration(wq_qc2e, max_spike_len = 2)
-wq_qc3 |> count(duration_class)
-
-# Step 4: check sustained excursions for corroborating signal in other channels
-wq_qc4 <- corroborate_sustained_excursions(wq_qc3, window = 12, corrob_z_thresh = 2)
-wq_qc4 |> filter(duration_class == "Sustained Excursion") |> count(run_corroborated)
-
-# Step 4b: check sustained excursions for a coincident signal at the other
-# two depths (same housing, same site -- a real event should show up in
-# turbidity at more than one depth even if conductivity/DO don't move)
-wq_qc4b <- corroborate_cross_depth(wq_qc4, z_thresh = 3.5, pad_readings = 1)
-wq_qc4b |> filter(duration_class == "Sustained Excursion") |> count(run_corroborated, depth_corroborated)
-
-# Step 5: finalize QC decision (removes gross-range fails and isolated spikes;
-# flags sustained excursions corroborated by neither other channels nor other
-# depths for manual review rather than removing them)
-wq_qc_final <- finalize_qc_flags(wq_qc4b)
+sj_wy_types <- read_sj_wy_types()
+wq_qc_final <- rri_qc_final()
 wq_qc_final |> count(qaqc_flag)
-
-# Step 6: analysis-ready turbidity for the Golden Mussel clarity comparison.
-# On top of turb_fnu_final, excludes the "Flagged: ... (review)" points
-# (excursions, erratic periods, depth drift) and
-# any summer episode above 100 FNU (+/- 6 hrs). These are most likely
-# vessel-wake/dredging resuspension or instrument problems -- real but
-# non-ambient conditions that confound a clarity comparison. Kept as a
-# separate column (rather than overwriting turb_fnu_final) so a with/without
-# sensitivity check is still possible later; analysis_exclusion records why.
-wq_qc_final <- prepare_analysis_turbidity(wq_qc_final, ceiling = 100, pad_readings = 24)
 wq_qc_final |> filter(month %in% 7:9) |> count(analysis_exclusion)
 
 # 5. SUMMER TURBIDITY ISOLATION & INVASION FLAG

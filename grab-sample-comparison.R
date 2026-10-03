@@ -3,12 +3,15 @@
 # shared by all three depths.
 #
 # Needs data/DWQ_DWR_EDI_2025.csv (EDI package edi.458.15, downloaded manually; gitignored)
-# and the QC output from turbidity-depth-RRI.R (sourced below if not already in memory).
+# and the QC output from rri_qc_final() in R/rri_multidepth_qc.R (loaded below if not already in memory).
 library(tidyverse)
 library(lubridate)
 library(here)
 
-if (!exists("wq_qc_final")) source(here("turbidity-depth-RRI.R"))
+source(here("R", "qc_functions.R"))
+source(here("R", "rri_multidepth_qc.R"))
+source(here("R", "mussel_analysis.R"))
+if (!exists("wq_qc_final")) wq_qc_final <- rri_qc_final()
 
 grab_station <- "P8"
 tz <- "Etc/GMT+8"                 # both records are in Pacific Standard Time (assumed for grab data)

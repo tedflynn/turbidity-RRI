@@ -9,7 +9,11 @@ library(tidyverse)
 library(lubridate)
 library(here)
 
-if (!exists("wq_qc_final")) source(here("turbidity-depth-RRI.R"))
+source(here("R", "qc_functions.R"))
+source(here("R", "rri_multidepth_qc.R"))
+source(here("R", "mussel_analysis.R"))
+if (!exists("wq_qc_final")) wq_qc_final <- rri_qc_final()
+sj_wy_types <- read_sj_wy_types()
 
 first_post_year <- 2025       # first summer after the detection (assumed Oct 2024; adjust if needed)
 early_years <- 2008:2010      # dropped in the second baseline
