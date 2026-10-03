@@ -148,8 +148,9 @@ did |>
 # average" test can flag recent years even with no new cause. This fits the group's baseline T against
 # year (a linear trend) and against wet / not-wet year type, then asks whether 2025 and 2026 fall below
 # what that model expects (prediction interval, so the model's own uncertainty is included).
-# WY-type.csv ends in 2025; 2026 is entered below as reported (Above Normal) and should be checked,
-# including which index (San Joaquin or Sacramento) the classification refers to.
+# WY-type.csv ends in 2025; 2026 is entered below as Above Normal on the San Joaquin index. That
+# classification is provisional until the final determination (expected January-February 2027);
+# update wy_type_2026 and rerun if it changes. Swapping it moves the 2026 Delta result only slightly.
 wy_type_2026 <- "AN"
 wy <- read_csv(here("data", "WY-type.csv"), show_col_types = FALSE, name_repair = "minimal") |>
   select(1, last_col()) |> setNames(c("year", "wy_type")) |>
