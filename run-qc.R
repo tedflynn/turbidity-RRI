@@ -28,3 +28,6 @@ qc_jobs |>
   map_dfr(~ load_station_qc(.x) |> count(qaqc_flag) |> mutate(series = .x)) |>
   pivot_wider(names_from = qaqc_flag, values_from = n, values_fill = 0) |>
   print(width = Inf)
+
+# A report of these results (counts, coverage, events, review queue, per-station plots) is in reports/qc-report.qmd:
+#   quarto render reports/qc-report.qmd

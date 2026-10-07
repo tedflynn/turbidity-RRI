@@ -61,7 +61,7 @@ build_daily_turbidity <- function(stations, use_cdec_2026 = TRUE, min_valid = 48
   single <- map(setdiff(stations, "RRI"), function(s) {
     qc <- load_station_qc(s)
     if (!use_cdec_2026) qc <- filter(qc, source == "primary")
-    qc_summary[[s]] <<- tibble(station = s, pct_valid = round(100 * mean(qc$qaqc_flag == "Valid", na.rm = TRUE), 1),
+    qc_summary[[s]] <<- tibble(station = s, pct_valid = round(100 * mean(qc$qaqc_flag[!is.na(qc$turb_fnu)] == "Valid"), 1),
                                first = as_date(min(qc$date_time[!is.na(qc$turb_fnu)])),
                                readings_with_turbidity = sum(!is.na(qc$turb_fnu)))
     qc |>

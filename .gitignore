@@ -68,3 +68,7 @@ data/qc/
 
 # Stray R graphics device output
 Rplots.pdf
+
+# Rendered QC report (rebuild with: quarto render reports/qc-report.qmd)
+reports/*.html
+reports/*_files/

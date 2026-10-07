@@ -107,7 +107,9 @@ run_station_qc <- function(jobs = qc_jobs, only = names(jobs)) {
     qc <- qc_single_sonde(here("data", job$file), job$limits, extra[file.exists(extra)])
     saveRDS(qc, qc_store(paste0(nm, "_qc.rds")))
     has_turb <- !is.na(qc$turb_fnu)
-    tibble(series = nm, pct_valid = round(100 * mean(qc$qaqc_flag == "Valid", na.rm = TRUE), 1),
+    # Share of the readings that have a turbidity value and passed every test. (Rows with no turbidity value
+    # carry qaqc_flag "Valid" because there was nothing to flag, so they are left out of the denominator.)
+    tibble(series = nm, pct_valid = round(100 * mean(qc$qaqc_flag[has_turb] == "Valid"), 1),
            first = as_date(min(qc$date_time[has_turb])), last = as_date(max(qc$date_time[has_turb])),
            readings_with_turbidity = sum(has_turb))
   })

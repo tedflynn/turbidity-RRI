@@ -1,0 +1,422 @@
+---
+title: "Continuous water quality QC report"
+subtitle: "Secondary screen for outliers, stuck sensors and erratic periods"
+date: now
+date-format: "D MMMM YYYY"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    toc-location: left
+    theme: cosmo
+    embed-resources: true
+    code-tools: true
+    fig-width: 9
+    fig-height: 5
+    fig-dpi: 130
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+library(tidyverse)
+library(lubridate)
+library(slider)
+library(here)
+library(scales)
+library(patchwork)
+library(knitr)
+
+source(here("R", "qc_functions.R"))
+source(here("R", "station_qc.R"))
+source(here("R", "qc_report_functions.R"))
+
+# Summaries of every stored QC result (run-qc.R writes them to data/qc/). Reading ten stations of
+# 15-minute data takes a minute or two.
+tabs <- qc_report_tables()
+
+series_levels <- names(qc_jobs)
+series_label <- function(s) if_else(s == "RRI_cdec_2026", "RRI (CDEC 2026)", s)
+lab_levels <- series_label(series_levels)
+fct_series <- function(s) factor(series_label(s), levels = rev(lab_levels))     # first station at the top
+
+theme_set(theme_minimal(base_size = 12) + theme(panel.grid.minor = element_blank(), legend.position = "bottom",
+                                                legend.title.position = "top"))
+pct1 <- function(x) sprintf("%.1f%%", x)
+```
+
+```{r}
+#| label: derived
+out <- tabs$outcome |>
+  mutate(label = qc_outcome_label(outcome),
+         source = if_else(series == "RRI_cdec_2026", "provisional", source))   # the CDEC file is provisional by design
+
+# Three groups of outcomes
+passed  <- c("Valid", "Corroborated event (kept)")
+removed <- c("Isolated spike (removed)", "Gross range (removed)")
+review  <- c("Uncorroborated excursion", "Flat line", "Erratic period")
+
+by_series <- out |>
+  group_by(series) |>
+  summarise(rows = sum(n),
+            no_value = sum(n[label == "No turbidity value"]),
+            screened = rows - no_value,
+            passed = sum(n[label %in% passed]),
+            removed = sum(n[label %in% removed]),
+            review = sum(n[label %in% review]),
+            .groups = "drop") |>
+  left_join(tabs$scope |> select(series, first, last, expected_rows, provisional_rows), by = "series") |>
+  mutate(across(c(passed, removed, review), ~ 100 * .x / screened, .names = "pct_{.col}"),
+         pct_no_value = 100 * no_value / rows,
+         pct_flagged = pct_removed + pct_review)
+
+tot <- by_series |> summarise(rows = sum(rows), screened = sum(screened), passed = sum(passed),
+                              removed = sum(removed), review = sum(review), no_value = sum(no_value))
+
+ev <- tabs$events |> mutate(label = qc_outcome_label(outcome))
+n_events_review <- ev |> filter(label %in% review) |> count(series, name = "review_events")
+```
+
+## At a glance
+
+- **`r format(tot$rows, big.mark = ",")` readings** from **`r nrow(by_series)` series** (`r format(min(by_series$first))` to `r format(max(by_series$last))`) went through the QC screen. `r format(tot$screened, big.mark = ",")` had a turbidity value to test; the other `r pct1(100 * tot$no_value / tot$rows)` are blank in the sonde files.
+- **`r pct1(100 * tot$passed / tot$screened)` passed** every test. **`r pct1(100 * tot$removed / tot$screened)` were removed** (isolated spikes and impossible values, set to missing in the final series) and **`r pct1(100 * tot$review / tot$screened)` were flagged for review** (kept in the data, left out of the analysis series).
+- The station with the largest share of flagged or removed readings is **`r series_label(by_series$series[which.max(by_series$pct_flagged)])`** (`r pct1(max(by_series$pct_flagged))`); the cleanest is **`r series_label(by_series$series[which.min(by_series$pct_flagged)])`** (`r pct1(min(by_series$pct_flagged))`).
+- **`r format(sum(n_events_review$review_events), big.mark = ",")` events** (runs of consecutive flagged readings) are waiting for a person to look at them. The longest are listed in [the review queue](#review-queue).
+
+```{r}
+#| label: tbl-glance
+#| tbl-cap: "Outcome of the screen by series. Percentages of readings with a turbidity value, except 'No value', which is a share of all rows."
+by_series |>
+  left_join(n_events_review, by = "series") |>
+  transmute(Series = series_label(series), From = format(first, "%Y-%m"), To = format(last, "%Y-%m"),
+            `Rows` = format(rows, big.mark = ","), `No value` = pct1(pct_no_value),
+            `Screened` = format(screened, big.mark = ","), `Passed` = pct1(pct_passed),
+            `Removed` = pct1(pct_removed), `Flagged for review` = pct1(pct_review),
+            `Review events` = replace_na(review_events, 0L)) |>
+  kable(align = "lrrrrrrrrr")
+```
+
+## How the readings fared
+
+```{r}
+#| label: fig-outcome
+#| fig-cap: "Share of screened readings that were removed or flagged, by station and reason. Stations are ordered by the total. Readings that passed (about 97-100%) are not drawn."
+#| fig-height: 4.5
+order_lvls <- by_series |> arrange(pct_flagged) |> pull(series) |> series_label()
+out |>
+  filter(!label %in% c(passed, "No turbidity value")) |>
+  group_by(series, label) |> summarise(n = sum(n), .groups = "drop") |>
+  left_join(by_series |> select(series, screened), by = "series") |>
+  mutate(pct = 100 * n / screened, Station = factor(series_label(series), levels = order_lvls)) |>
+  ggplot(aes(pct, Station, fill = label)) +
+  geom_col(width = 0.7) +
+  geom_text(data = by_series |> mutate(Station = factor(series_label(series), levels = order_lvls)),
+            aes(pct_flagged, Station, label = pct1(pct_flagged), fill = NULL), hjust = -0.15, size = 3.6) +
+  scale_fill_manual(values = qc_outcome_colours, name = NULL) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.12)), labels = label_number(suffix = "%")) +
+  labs(x = "Share of screened readings", y = NULL) +
+  guides(fill = guide_legend(nrow = 1))
+```
+
+```{r}
+#| label: fig-heat-flagged
+#| fig-cap: "Share of screened readings removed or flagged, by station and year. Dark cells are where to look first: a bad deployment, a fouled sensor or a stretch of erratic data."
+#| fig-height: 4.8
+out |>
+  filter(label != "No turbidity value") |>
+  group_by(series, year) |>
+  summarise(pct = 100 * sum(n[label %in% c(removed, review)]) / sum(n), .groups = "drop") |>
+  mutate(Station = fct_series(series)) |>
+  ggplot(aes(factor(year), Station, fill = pct)) +
+  geom_tile(colour = "white", linewidth = 0.4) +
+  geom_text(aes(label = if_else(pct >= 1, sprintf("%.0f", pct), "")), size = 2.9, colour = "white") +
+  scale_fill_viridis_c(option = "magma", direction = -1, trans = "sqrt", name = "% flagged\nor removed",
+                       breaks = c(0, 1, 5, 20, 50), labels = label_number(suffix = "%")) +
+  labs(x = NULL, y = NULL) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5), legend.key.width = unit(1.3, "cm"))
+```
+
+```{r}
+#| label: fig-coverage
+#| fig-cap: "Data coverage: share of the 15-minute readings in each year that have a turbidity value. Gaps are missing sensor output, not QC decisions."
+#| fig-height: 4.8
+tabs$scope |>
+  select(series, first, last) |>
+  cross_join(tibble(year = 2005:max(year(tabs$scope$last)))) |>
+  mutate(start = pmax(as_date(paste0(year, "-01-01")), first), end = pmin(as_date(paste0(year, "-12-31")), last),
+         days = as.numeric(end - start) + 1) |>
+  filter(days > 0) |>
+  left_join(out |> filter(label != "No turbidity value") |> group_by(series, year) |> summarise(n = sum(n), .groups = "drop"),
+            by = c("series", "year")) |>
+  mutate(coverage = 100 * replace_na(n, 0) / (96 * days), Station = fct_series(series)) |>
+  ggplot(aes(factor(year), Station, fill = coverage)) +
+  geom_tile(colour = "white", linewidth = 0.4) +
+  geom_text(aes(label = sprintf("%.0f", coverage)), size = 2.7, colour = "grey15") +
+  scale_fill_gradient(low = "#F6D9D2", high = "#2E86AB", limits = c(0, 100), name = "Coverage",
+                      labels = label_number(suffix = "%")) +
+  labs(x = NULL, y = NULL) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5), legend.key.width = unit(1.3, "cm"))
+```
+
+## Which sensors produce the most out-of-range values
+
+Every parameter on a sonde gets a range screen (physically impossible for the sensor or the river, such as pH of 277 or a 9999 code). Only turbidity gets the outlier, erratic-period and flat-line tests (see [Methods](#methods)), so for the other parameters this is the full extent of the screen.
+
+```{r}
+#| label: fig-sensors
+#| fig-cap: "Range-screen failures per 100,000 readings, by station and sensor (all years). Numbers are the count of failed readings. Grey cells: the station does not report that parameter."
+#| fig-height: 4.6
+sens <- tabs$params |>
+  group_by(series, param) |>
+  summarise(measured = sum(measured), fail = sum(range_fail), .groups = "drop") |>
+  left_join(qc_params |> select(param, label), by = "param") |>
+  mutate(rate = 1e5 * fail / pmax(measured, 1), Station = fct_series(series),
+         label = factor(label, levels = qc_params$label))
+ggplot(sens, aes(label, Station, fill = if_else(measured == 0, NA_real_, rate))) +
+  geom_tile(colour = "white", linewidth = 0.5) +
+  geom_text(aes(label = if_else(measured == 0, "", format(fail, big.mark = ","))), size = 3.2) +
+  scale_fill_gradient(low = "#FFF3E0", high = "#B23A00", trans = "sqrt", na.value = "grey90",
+                      name = "per 100,000\nreadings", labels = label_number(big.mark = ",")) +
+  labs(x = NULL, y = NULL) +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1), legend.key.width = unit(1.3, "cm"))
+```
+
+```{r}
+#| label: tbl-sensors
+#| tbl-cap: "Readings reported and range failures by sensor, all stations combined."
+sens |>
+  group_by(Sensor = label) |>
+  summarise(Stations = sum(measured > 0), Readings = sum(measured), `Range failures` = sum(fail),
+            `Per 100,000` = round(1e5 * sum(fail) / sum(measured), 1), .groups = "drop") |>
+  mutate(across(c(Readings, `Range failures`), ~ format(.x, big.mark = ","))) |>
+  kable(align = "lrrrr")
+```
+
+## Events: when and where the trouble was {#events}
+
+An *event* is a run of consecutive readings with the same flag. Isolated spikes (one or two readings) are numerous and are counted in the figures above; this timeline shows the longer disturbances, which are the ones that can bias a seasonal or annual comparison.
+
+```{r}
+#| label: fig-timeline
+#| fig-cap: "Flagged events lasting at least 3 hours (isolated spikes excluded). Point size is the event duration; colour is the flag."
+#| fig-height: 5.2
+ev |>
+  filter(label %in% c(review, "Corroborated event (kept)"), hours >= 3) |>
+  mutate(Station = fct_series(series)) |>
+  ggplot(aes(start, Station)) +
+  geom_point(aes(size = hours, colour = label), alpha = 0.55) +
+  scale_size_area(max_size = 9, breaks = c(6, 24, 24 * 7, 24 * 30), labels = c("6 h", "1 day", "1 week", "1 month"),
+                  name = "Duration") +
+  scale_colour_manual(values = qc_outcome_colours, name = NULL) +
+  scale_x_datetime(date_breaks = "2 years", date_labels = "%Y") +
+  scale_y_discrete(drop = FALSE) +
+  labs(x = NULL, y = NULL) +
+  guides(colour = guide_legend(nrow = 2, override.aes = list(size = 4)), size = guide_legend(nrow = 1))
+```
+
+```{r}
+#| label: fig-season
+#| fig-cap: "Share of screened readings removed or flagged by calendar month, all years. A seasonal pattern points to something real (storms, vessel traffic, algal blooms, summer fouling) rather than random sensor faults."
+#| fig-height: 4.6
+out |>
+  filter(label != "No turbidity value") |>
+  group_by(series, month) |>
+  summarise(pct = 100 * sum(n[label %in% c(removed, review)]) / sum(n), .groups = "drop") |>
+  mutate(Station = fct_series(series), Month = factor(month.abb[month], levels = month.abb)) |>
+  ggplot(aes(Month, Station, fill = pct)) +
+  geom_tile(colour = "white", linewidth = 0.4) +
+  geom_text(aes(label = sprintf("%.1f", pct)), size = 2.9, colour = "white") +
+  scale_fill_viridis_c(option = "magma", direction = -1, trans = "sqrt", name = "% flagged\nor removed",
+                       breaks = c(0.1, 0.5, 1, 2, 5), labels = label_number(suffix = "%")) +
+  labs(x = NULL, y = NULL) +
+  theme(legend.key.width = unit(2, "cm"))
+```
+
+```{r}
+#| label: fig-provisional
+#| fig-cap: "Flag rate in the QC'd record versus the provisional CDEC readings (real-time, no field QC) appended to it. The provisional readings cover only 2026, so a single event can dominate a station's rate."
+#| fig-height: 4
+prov <- out |>
+  filter(label != "No turbidity value") |>
+  group_by(series, source) |>
+  summarise(pct = 100 * sum(n[label %in% c(removed, review)]) / sum(n), n = sum(n), .groups = "drop") |>
+  mutate(Station = fct_series(series), Source = recode(source, primary = "QC'd record", provisional = "Provisional CDEC"))
+ggplot(prov, aes(pct, Station, fill = Source)) +
+  geom_col(position = position_dodge2(preserve = "single"), width = 0.7) +
+  scale_fill_manual(values = c("QC'd record" = "#7A8B99", "Provisional CDEC" = "#E69F00"), name = NULL) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.08)), labels = label_number(suffix = "%")) +
+  labs(x = "Share of screened readings removed or flagged", y = NULL)
+```
+
+## What changed recently {#recent}
+
+Each station's last 12 months compared with its own history: months whose share of removed or flagged readings is at or above the station's 95th percentile of all months. A station creeping upward over several months is the pattern of a fouling or failing sensor.
+
+```{r}
+#| label: tbl-recent
+#| tbl-cap: "Months in the last 12 whose removed-or-flagged share is in the top 5% of that station's own record (months with at least 1,000 screened readings)."
+monthly <- out |>
+  filter(label != "No turbidity value") |>
+  group_by(series, year, month) |>
+  summarise(screened = sum(n), pct = 100 * sum(n[label %in% c(removed, review)]) / sum(n),
+            spikes = 100 * sum(n[label == "Isolated spike (removed)"]) / sum(n), .groups = "drop") |>
+  filter(screened >= 1000) |>
+  mutate(month_start = make_date(year, month, 1)) |>
+  group_by(series) |>
+  mutate(typical = median(pct), pctile = ecdf(pct)(pct), p95 = quantile(pct, 0.95)) |>
+  ungroup()
+latest <- max(monthly$month_start)
+recent <- monthly |> filter(month_start > latest %m-% months(12), pct >= p95, pct > 0.5)
+if (nrow(recent) == 0) {
+  cat("No station has a month in the last 12 that is unusually high for its own record.\n")
+} else {
+  recent |>
+    arrange(series, month_start) |>
+    transmute(Station = series_label(series), Month = format(month_start, "%Y-%m"), `Screened` = format(screened, big.mark = ","),
+              `Removed or flagged` = pct1(pct), `of which isolated spikes` = pct1(spikes),
+              `Station's typical month` = pct1(typical)) |>
+    kable(align = "llrrrr")
+}
+```
+
+## Review queue {#review-queue}
+
+The longest events flagged for review. These stay in the data; they are only left out of the analysis series. The baseline is the median of the valid readings in the 24 hours before the event.
+
+```{r}
+#| label: tbl-queue
+#| tbl-cap: "The 25 longest events flagged for review."
+ev |>
+  filter(label %in% review) |>
+  arrange(desc(hours)) |>
+  slice_head(n = 25) |>
+  transmute(Station = series_label(series), Flag = label, Start = format(start, "%Y-%m-%d %H:%M"),
+            Days = round(hours / 24, 1), `Peak (FNU/NTU)` = round(peak_fnu, 1),
+            `Median in event` = round(median_fnu, 1), `Baseline before` = round(baseline_fnu, 1)) |>
+  kable(align = "llrrrrr")
+```
+
+```{r}
+#| label: tbl-spikes
+#| tbl-cap: "The 15 largest isolated spikes that were removed (peak relative to the baseline before)."
+ev |>
+  filter(label == "Isolated spike (removed)", is.finite(peak_fnu)) |>
+  arrange(desc(peak_fnu)) |>
+  slice_head(n = 15) |>
+  transmute(Station = series_label(series), Time = format(start, "%Y-%m-%d %H:%M"),
+            Readings = n_readings, `Peak (FNU/NTU)` = round(peak_fnu, 1), `Baseline before` = round(baseline_fnu, 1)) |>
+  kable(align = "llrrr")
+```
+
+### Could excursions be corroborated?
+
+A sustained turbidity excursion is kept as a real event if conductivity or dissolved oxygen shifts at the same time (a storm, a tidal intrusion). Stations that report turbidity only (the CDEC downloads) cannot pass that test, so their excursions are flagged by construction.
+
+```{r}
+#| label: tbl-corroboration
+#| tbl-cap: "Sustained excursions (more than two consecutive outlier readings) and whether a second channel was available."
+tabs$corroboration |>
+  filter(excursion_readings > 0) |>
+  transmute(Station = series_label(series), `Excursion readings` = excursion_readings,
+            `With conductivity or DO` = pct1(100 * with_channels / excursion_readings),
+            `Corroborated` = pct1(100 * corroborated / excursion_readings)) |>
+  kable(align = "lrrr")
+```
+
+## Station detail
+
+For each station: the daily median of the final turbidity series (log scale), with a marker on each day that had removed or flagged readings, placed at the day's peak reading. The lower panel zooms to the last two years.
+
+```{r}
+#| label: station-fn
+drawn <- c("Isolated spike (removed)", "Gross range (removed)", "Uncorroborated excursion", "Flat line", "Erratic period")
+station_plot <- function(s) {
+  d <- tabs$daily |> filter(series == s, !is.na(median_final))
+  f <- tabs$flag_days |> filter(series == s, is.finite(peak_fnu), peak_fnu > 0) |> mutate(label = qc_outcome_label(outcome))
+  lim <- drawn[drawn %in% as.character(f$label)]            # legend lists only the flag types this station has
+  if (length(lim) == 0) lim <- drawn[1]
+  base <- function(d, f) {
+    ggplot() +
+      geom_line(data = d, aes(date, median_final), colour = "grey35", linewidth = 0.35) +
+      geom_point(data = f, aes(date, peak_fnu, colour = label), size = 1.1, alpha = 0.7) +
+      scale_colour_manual(values = qc_outcome_colours[lim], limits = lim, name = NULL) +
+      scale_y_log10(labels = label_number(drop0trailing = TRUE)) +
+      labs(x = NULL, y = "Turbidity (FNU/NTU)")
+  }
+  leg <- guides(colour = guide_legend(nrow = 2, override.aes = list(size = 3, alpha = 1)))
+  p1 <- base(d, f) + labs(title = paste(series_label(s), "- full record"))
+  if (as.numeric(max(d$date) - min(d$date)) < 800) return(p1 + leg)
+  from <- max(d$date) - 730
+  p2 <- base(filter(d, date >= from), filter(f, date >= from)) + labs(title = "Last two years") + leg
+  p1 <- p1 + theme(legend.position = "none")       # one legend, under the lower panel
+  p1 / p2
+}
+```
+
+```{r}
+#| label: station-tabs
+#| results: asis
+tmpl <- c("### {{s}}", "", "```{r}", "#| echo: false", "#| fig-height: 6.4", "station_plot('{{s}}')", "```", "")
+cat("::: {.panel-tabset}\n\n")
+cat(unlist(lapply(series_levels, function(s) knitr::knit_child(text = knitr::knit_expand(text = tmpl, s = s), quiet = TRUE))), sep = "\n")
+cat(":::\n")
+```
+
+## Methods {#methods}
+
+This is the *secondary* screen. It runs after the field-based primary QC (Wagner et al. 2006 method), and it catches residual statistical outliers rather than redoing field QC. **Nothing is deleted:** every reading stays in the stored files with a `qaqc_flag` and the flag column of each step. Settings below are read from the functions in `R/qc_functions.R`, so the table always matches the code that ran.
+
+```{r}
+#| label: tbl-methods
+f1 <- formals(check_gross_range); f2 <- formals(flag_robust_outliers); f3 <- formals(flag_erratic_periods)
+f4 <- formals(flag_flat_lines); f5 <- formals(classify_run_duration); f6 <- formals(corroborate_sustained_excursions)
+tribble(
+  ~Step, ~`What it catches`, ~Setting, ~Outcome,
+  "Gross range", "Turbidity outside the sensor's physical range",
+    sprintf("%g to %g FNU", f1$min_val, f1$max_val), "Removed",
+  "Parameter ranges", "Impossible temperature, pH, conductivity, DO, chlorophyll (error codes, failed sensors)",
+    "see table below", "Value set to missing in the <parameter>_qc column",
+  "Robust outlier", "A reading far from its neighbours (rolling median and MAD, modified z-score)",
+    sprintf("+/-%d readings (%g h); |z| > %g and more than %g FNU from the median", f2$window, f2$window / 4, f2$z_thresh, f2$noise_floor),
+    "Candidate: classified next",
+  "Isolated spike", "An outlier run that returns to baseline at once",
+    sprintf("%d readings or fewer (%g min)", f5$max_spike_len, 15 * f5$max_spike_len), "Removed",
+  "Sustained excursion", "An outlier run longer than a spike",
+    sprintf("kept if conductivity or DO also shifts (|z| > %g), otherwise flagged", f6$corrob_z_thresh),
+    "Kept as a real event, or flagged for review",
+  "Erratic period", "A long stretch of jumpy data that the rolling window cannot see",
+    sprintf("median 15-min change over +/-%g h exceeds %g FNU", f3$window / 4, f3$jump_thresh), "Flagged for review",
+  "Flat line", "A stuck sensor repeating one value",
+    sprintf("%d or more identical readings (%g h), plus %d readings either side", f4$min_run, f4$min_run / 4, f4$pad_readings),
+    "Flagged for review"
+) |> kable()
+```
+
+```{r}
+#| label: tbl-limits
+#| tbl-cap: "Range limits used by the parameter screen. Brackish tidal stations (TWI, ANH, BLP) get a higher conductivity ceiling."
+limit_tbl <- function(l) imap_dfr(l, ~ tibble(Parameter = .y, Low = .x[1], High = .x[2]))
+left_join(limit_tbl(param_limits), limit_tbl(tidal_cond) |> rename(`Low (tidal)` = Low, `High (tidal)` = High), by = "Parameter") |>
+  mutate(`Low (tidal)` = if_else(`Low (tidal)` == Low & `High (tidal)` == High, NA_real_, `Low (tidal)`),
+         `High (tidal)` = if_else(is.na(`Low (tidal)`), NA_real_, `High (tidal)`)) |>
+  kable(align = "lrrrr")
+```
+
+## Reading this report
+
+- **A flag is not a verdict.** Vessel wakes, storms and dredging produce real turbidity pulses that look like outliers. Flagged readings are kept so that a person can decide; the "analysis" series leaves them out only because the Golden Mussel comparison is about ambient clarity.
+- **Flag rates are not sensor grades.** A station with a high rate may sit in a harsher spot (shipping channel, tidal slough) rather than have a worse sonde. Compare a station with its own history (the year-by-year heat map) before comparing it with others.
+- **Only turbidity is fully screened.** The other parameters have range checks, and they act as corroborating channels for turbidity. Extending the outlier, erratic and flat-line tests to them is a planned step.
+- **Provisional data are different.** The 2026 CDEC readings are real-time and have had no field QC, and they carry turbidity only, so they run a stricter test (no second channel to corroborate).
+- **Valid means tested and passed.** Rows where the sonde recorded nothing are counted separately as "No turbidity value" and are not in any percentage of screened readings.
+
+```{r}
+#| label: appendix
+#| results: asis
+cat("*Report generated", format(Sys.time(), "%Y-%m-%d %H:%M %Z"), "from the QC results stored on",
+    format(max(file.mtime(list.files(here("data", "qc"), pattern = "_qc[.]rds$", full.names = TRUE))), "%Y-%m-%d %H:%M"), "*\n")
+```
