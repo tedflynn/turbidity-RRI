@@ -38,7 +38,15 @@ source(here("R", "qc_report_functions.R"))
 # 15-minute data takes a minute or two.
 tabs <- qc_report_tables()
 
-series_levels <- names(qc_jobs)
+region_order <- c("SJR corridor", "South Delta", "Export intakes", "Central Delta", "West Delta", "Sacramento River", "Delta gateway", "Suisun Bay")
+regions <- read_csv(here("data", "station_screening.csv"), show_col_types = FALSE) |>
+  transmute(series = station, region = str_replace(region, " \\(.*\\)", ""))
+series_levels <- tibble(series = names(qc_jobs)) |>
+  left_join(regions, by = "series") |>
+  mutate(region = replace_na(region, "SJR corridor"),                         # RRI_cdec_2026
+         region = factor(region, levels = region_order)) |>
+  arrange(region, match(series, names(qc_jobs))) |>
+  pull(series)
 series_label <- function(s) if_else(s == "RRI_cdec_2026", "RRI (CDEC 2026)", s)
 lab_levels <- series_label(series_levels)
 fct_series <- function(s) factor(series_label(s), levels = rev(lab_levels))     # first station at the top
@@ -105,7 +113,7 @@ by_series |>
 ```{r}
 #| label: fig-outcome
 #| fig-cap: "Share of screened readings that were removed or flagged, by station and reason. Stations are ordered by the total. Readings that passed (about 97-100%) are not drawn."
-#| fig-height: 4.5
+#| fig-height: 9
 order_lvls <- by_series |> arrange(pct_flagged) |> pull(series) |> series_label()
 out |>
   filter(!label %in% c(passed, "No turbidity value")) |>
@@ -125,7 +133,7 @@ out |>
 ```{r}
 #| label: fig-heat-flagged
 #| fig-cap: "Share of screened readings removed or flagged, by station and year. Dark cells are where to look first: a bad deployment, a fouled sensor or a stretch of erratic data."
-#| fig-height: 4.8
+#| fig-height: 10
 out |>
   filter(label != "No turbidity value") |>
   group_by(series, year) |>
@@ -143,7 +151,7 @@ out |>
 ```{r}
 #| label: fig-coverage
 #| fig-cap: "Data coverage: share of the 15-minute readings in each year that have a turbidity value. Gaps are missing sensor output, not QC decisions."
-#| fig-height: 4.8
+#| fig-height: 10
 tabs$scope |>
   select(series, first, last) |>
   cross_join(tibble(year = 2005:max(year(tabs$scope$last)))) |>
@@ -169,7 +177,7 @@ Every parameter on a sonde gets a range screen (physically impossible for the se
 ```{r}
 #| label: fig-sensors
 #| fig-cap: "Range-screen failures per 100,000 readings, by station and sensor (all years). Numbers are the count of failed readings. Grey cells: the station does not report that parameter."
-#| fig-height: 4.6
+#| fig-height: 9
 sens <- tabs$params |>
   group_by(series, param) |>
   summarise(measured = sum(measured), fail = sum(range_fail), .groups = "drop") |>
@@ -203,7 +211,7 @@ An *event* is a run of consecutive readings with the same flag. Isolated spikes 
 ```{r}
 #| label: fig-timeline
 #| fig-cap: "Flagged events lasting at least 3 hours (isolated spikes excluded). Point size is the event duration; colour is the flag."
-#| fig-height: 5.2
+#| fig-height: 9
 ev |>
   filter(label %in% c(review, "Corroborated event (kept)"), hours >= 3) |>
   mutate(Station = fct_series(series)) |>
@@ -221,7 +229,7 @@ ev |>
 ```{r}
 #| label: fig-season
 #| fig-cap: "Share of screened readings removed or flagged by calendar month, all years. A seasonal pattern points to something real (storms, vessel traffic, algal blooms, summer fouling) rather than random sensor faults."
-#| fig-height: 4.6
+#| fig-height: 9
 out |>
   filter(label != "No turbidity value") |>
   group_by(series, month) |>
@@ -236,10 +244,33 @@ out |>
   theme(legend.key.width = unit(2, "cm"))
 ```
 
+### Is the sensor the same through time?
+
+A change of sensor, or of how the data were processed, can look like a change in the water. This view shows how jumpy each station's turbidity is from year to year. The step rises and falls with turbidity itself (a wet year is noisier than a dry one), so the thing to look for is a step in noise that comes with no change in the median level. Chipps Island (MAL) is the clear case: its step is about 2 in 2008-2010, about 6 in 2011-2024, and 0.7 in 2025, with a median level of 13-14 in both 2024 and 2025, while its neighbours do not change. The old Old River, Middle River and Tracy stations (MHO, OH1, TWA, MRU) show a smaller drop in 2004-2005. Check the deployment logs for sensor swaps before using a station's record across a change.
+
+```{r}
+#| label: fig-noise
+#| fig-cap: "Typical size of the 15-minute step in turbidity, by year, relative to each station's own median across years (colour: red = noisier than usual, blue = quieter). Numbers are the median step in FNU/NTU. A sudden change in one station, with its neighbours unchanged, points to a different sensor or different processing."
+#| fig-height: 10
+tabs$noise |>
+  group_by(series) |>
+  mutate(rel = log2(noise / median(noise))) |>
+  ungroup() |>
+  filter(readings >= 5000) |>
+  mutate(Station = fct_series(series)) |>
+  ggplot(aes(factor(year), Station, fill = pmax(pmin(rel, 3), -3))) +
+  geom_tile(colour = "white", linewidth = 0.4) +
+  geom_text(aes(label = if_else(noise >= 10, sprintf("%.0f", noise), sprintf("%.2f", noise))), size = 2.3, colour = "grey10") +
+  scale_fill_gradient2(low = "#2C7BB6", mid = "white", high = "#D7191C", midpoint = 0, name = "vs station median",
+                       breaks = c(-3, -1.58, 0, 1.58, 3), labels = c("1/8", "1/3", "same", "3x", "8x")) +
+  labs(x = NULL, y = NULL) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5), legend.key.width = unit(1.3, "cm"))
+```
+
 ```{r}
 #| label: fig-provisional
 #| fig-cap: "Flag rate in the QC'd record versus the provisional CDEC readings (real-time, no field QC) appended to it. The provisional readings cover only 2026, so a single event can dominate a station's rate."
-#| fig-height: 4
+#| fig-height: 8
 prov <- out |>
   filter(label != "No turbidity value") |>
   group_by(series, source) |>
@@ -389,7 +420,7 @@ tribble(
     sprintf("kept if conductivity or DO also shifts (|z| > %g), otherwise flagged", f6$corrob_z_thresh),
     "Kept as a real event, or flagged for review",
   "Erratic period", "A long stretch of jumpy data that the rolling window cannot see",
-    sprintf("median 15-min change over +/-%g h exceeds %g FNU", f3$window / 4, f3$jump_thresh), "Flagged for review",
+    sprintf("median 15-min change over +/-%g h exceeds %g FNU (Chipps Island and Suisun Bay stations: ten times the station's typical step instead, see qc_summary.csv)", f3$window / 4, f3$jump_thresh), "Flagged for review",
   "Flat line", "A stuck sensor repeating one value",
     sprintf("%d or more identical readings (%g h), plus %d readings either side", f4$min_run, f4$min_run / 4, f4$pad_readings),
     "Flagged for review"
@@ -404,6 +435,22 @@ left_join(limit_tbl(param_limits), limit_tbl(tidal_cond) |> rename(`Low (tidal)`
   mutate(`Low (tidal)` = if_else(`Low (tidal)` == Low & `High (tidal)` == High, NA_real_, `Low (tidal)`),
          `High (tidal)` = if_else(is.na(`Low (tidal)`), NA_real_, `High (tidal)`)) |>
   kable(align = "lrrrr")
+```
+
+### File integrity
+
+A parameter that rises or falls steadily with time (rank correlation with time of 0.8 or more) points to a sorted or damaged column, as in the Chipps Island (MAL) conductivity that led to that station being dropped.
+
+```{r}
+#| label: tbl-integrity
+#| tbl-cap: "Parameters most strongly trending with time, by station (Spearman correlation with time). Values near 1 or -1 would mean a damaged column; moderate values are real long-term change."
+tabs$integrity |>
+  filter(abs(rho_time) >= 0.4) |>
+  arrange(desc(abs(rho_time))) |>
+  left_join(qc_params |> select(param, label), by = "param") |>
+  transmute(Station = series_label(series), Parameter = label, Readings = format(n, big.mark = ","),
+            `Correlation with time` = sprintf("%.2f", rho_time), Suspect = if_else(suspect, "yes", "no")) |>
+  kable(align = "llrrr")
 ```
 
 ## Reading this report

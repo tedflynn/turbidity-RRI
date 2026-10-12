@@ -72,3 +72,6 @@ Rplots.pdf
 # Rendered QC report (rebuild with: quarto render reports/qc-report.qmd)
 reports/*.html
 reports/*_files/
+
+# Raw EDI downloads (large; re-download from EDI)
+raw-EDI-data/

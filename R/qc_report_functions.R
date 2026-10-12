@@ -105,8 +105,18 @@ qc_summarise_series <- function(name) {
     summarise(n = n(), peak_fnu = max(turb_fnu, na.rm = TRUE), .groups = "drop") |>
     mutate(series = name, .before = 1)
 
+  # Typical size of the 15-minute step in turbidity, by year: a sudden change in it points to a different sensor
+  # or different processing (abs_jump is the step after the range screen, from the erratic-period test)
+  noise <- x |>
+    filter(!is.na(abs_jump)) |>
+    group_by(year) |>
+    summarise(readings = n(), noise = median(abs_jump), level = median(turb_fnu_qc, na.rm = TRUE), .groups = "drop") |>
+    mutate(series = name, .before = 1)
+
+  integrity <- qc_integrity(x_all) |> mutate(series = name, .before = 1)
+
   list(scope = scope, outcome = outcome, params = params, corroboration = corroboration,
-       daily = daily, flag_days = flag_days, events = qc_events_one(x, name))
+       daily = daily, flag_days = flag_days, noise = noise, integrity = integrity, events = qc_events_one(x, name))
 }
 
 # All series: a list with one bound table per element. `series` defaults to every stored QC result.

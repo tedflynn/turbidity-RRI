@@ -31,3 +31,8 @@ qc_jobs |>
 
 # A report of these results (counts, coverage, events, review queue, per-station plots) is in reports/qc-report.qmd:
 #   quarto render reports/qc-report.qmd
+
+# File integrity: any parameter that rises or falls steadily with time looks like a sorted or damaged column
+cat("\nParameters that are a steady ramp through time (|Spearman rho with time| >= 0.8); none expected:\n")
+integrity <- check_stored_integrity()
+print(filter(integrity, suspect))
